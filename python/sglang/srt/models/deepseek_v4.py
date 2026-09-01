@@ -2310,12 +2310,39 @@ class DeepseekV4DecoderLayer(nn.Module):
                     f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
-                hidden_states,
-            )
+            local_hidden_states = hidden_states
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+
+            if envs.SGLANG_OPT_USE_AITER_TP_MOE_STAGE1.get():
+                from sglang.srt.layers.moe.aiter_tp_moe import (
+                    run_aiter_tp_moe_stage1,
+                    tp_moe_stage1_prequant_disable_reason,
+                )
+
+                disable_reason = tp_moe_stage1_prequant_disable_reason(
+                    self.mlp,
+                    forward_batch,
+                    shared_expert_is_local=_do_shared_local,
+                )
+                if disable_reason is None:
+                    hidden_states = run_aiter_tp_moe_stage1(
+                        self.mlp,
+                        local_hidden_states,
+                        forward_batch,
+                        input_ids=input_ids,
+                    )
+                    if _shared_local is not None:
+                        hidden_states = hidden_states + _shared_local[
+                            : hidden_states.shape[0]
+                        ]
+                    return hidden_states
+                logger.warning_once(
+                    "SGLANG_OPT_USE_AITER_TP_MOE_STAGE1 requested but this "
+                    f"forward uses the standard path: {disable_reason}."
+                )
+
+            hidden_states = get_global_dp_buffer(get_tp_group())
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)

@@ -817,6 +817,11 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    # Experimental DeepSeek-V4 non-EP DP+TP-MoE decode path. Keep each DP
+    # rank's hidden states local through routing, quantize them to MXFP8, then
+    # let AITER TPMoEStage1 all-gather the payload/scales and run the TP-sharded
+    # expert GEMMs before the existing reduce-scatter combine.
+    SGLANG_OPT_USE_AITER_TP_MOE_STAGE1 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
