@@ -577,6 +577,17 @@ class _MoriEPDispatcherImplBase:
         self.meta_overlap_args = None
 
     def _combine_kwargs(self, hidden_states: torch.Tensor) -> dict:
+        if self.overlap_args is not None and self.overlap_args.abi_version == 1:
+            if not self.mori_op.supports_sbo_tile_signal_v1():
+                raise RuntimeError("installed MORI does not support SBO tile signal v1")
+            return {
+                "sbo_route_tiles": self.overlap_args.route_tiles[
+                    : hidden_states.shape[0]
+                ],
+                "sbo_tile_state": self.overlap_args.tile_state,
+                "sbo_expected_n_tiles": self.overlap_args.expected_n_tiles,
+                "block_num": self.overlap_args.num_sms,
+            }
         return {}
 
 
@@ -590,10 +601,25 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
         # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
         self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
-        self.enable_dual_stream = is_tbo_enabled()
+        from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
+
+        self.enable_dual_stream = (
+            is_tbo_enabled() or SboFlags.enable_mori_aiter_tile_pipeline()
+        )
         self._comm_stream = None
         if self.enable_dual_stream:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+
+    def supports_mori_aiter_sbo_v1(self) -> bool:
+        self._apply_dispatch_dtype_override()
+        return (
+            self.router_topk == 6
+            and self.num_local_experts == 48
+            and self.hidden_size == 7168
+            and self.combine_dtype == CombineDtype.fp8
+            and not self.enable_sdma
+            and self.use_external_inp_buf
+        )
 
     def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
         assert self.enable_dual_stream, "dual stream must be enabled"
@@ -819,7 +845,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        previous_event = self._capture_event_if_async() if self._comm_stream else None
+        is_sbo = self.overlap_args is not None and self.overlap_args.abi_version == 1
+        use_comm_stream = is_tbo_enabled() or is_sbo
+        previous_event = (
+            self._capture_event_if_async()
+            if self._comm_stream and use_comm_stream and not is_sbo
+            else None
+        )
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
@@ -842,14 +874,19 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
-        if self._comm_stream:
+        use_comm_stream = is_tbo_enabled() or (
+            self.overlap_args is not None and self.overlap_args.abi_version == 1
+        )
+        if self._comm_stream and use_comm_stream:
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream
 
             # No `record_stream(comm_stream)` -- see `_dispatch_core`.
 
             with torch.cuda.stream(comm_stream):
-                if previous_event is not None:
+                if self.overlap_args is not None and self.overlap_args.abi_version == 1:
+                    comm_stream.wait_event(self.overlap_args.wait_event)
+                elif previous_event is not None:
                     comm_stream.wait_event(previous_event)
                 else:
                     comm_stream.wait_stream(compute_stream)
@@ -1243,6 +1280,13 @@ class MoriEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def supports_mori_aiter_sbo_v1(self) -> bool:
+        return (
+            self.deepep_mode == DeepEPMode.NORMAL
+            and hasattr(self, "_normal_dispatcher")
+            and self._normal_dispatcher.supports_mori_aiter_sbo_v1()
+        )
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict

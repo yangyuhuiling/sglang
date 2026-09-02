@@ -36,7 +36,11 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
+from sglang.srt.batch_overlap.single_batch_overlap import (
+    MoriAiterSboWorkspace,
+    SboFlags,
+    compute_overlap_args,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -861,9 +865,32 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._mori_aiter_sbo_geometry_eligible = (
+            is_deepseek_v4
+            and config.hidden_size == 7168
+            and config.moe_intermediate_size == 3072
+            and config.n_routed_experts == 384
+            and config.num_experts_per_tok == 6
+            and get_parallel().moe_ep_size == 8
+            and get_parallel().moe_tp_size == 1
+            and get_exec().moe.ep_num_redundant_experts == 0
+            and self.num_fused_shared_experts == 0
+            and self.experts.num_local_experts == 48
+        )
+        if (
+            SboFlags.mori_aiter_tile_pipeline_requested()
+            and not SboFlags.enable_mori_aiter_tile_pipeline()
+        ):
+            logger.warning_once(
+                "MORI AITER SBO requested but tile-signal v1 capability is "
+                "unavailable; falling back to ordinary MORI execution"
+            )
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
+        self._mori_aiter_sbo_workspace = MoriAiterSboWorkspace(
+            num_experts=config.n_routed_experts
+        )
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -1267,7 +1294,20 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        mori_aiter_sbo_flag = (
+            not self.is_nextn
+            and SboFlags.enable_mori_aiter_tile_pipeline()
+            and self._mori_aiter_sbo_geometry_eligible
+            and self.experts.dispatcher.supports_mori_aiter_sbo_v1()
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.is_extend_in_batch
+            and not get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
+        )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        if SboFlags.enable_mori_aiter_tile_pipeline():
+            sbo_enabled_flag = mori_aiter_sbo_flag
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )
@@ -1278,7 +1318,9 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if (
+                not sbo_enabled_flag or mori_aiter_sbo_flag
+            ) and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1317,7 +1359,47 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
 
-        if sbo_overlap_dispatch_flag:
+        if mori_aiter_sbo_flag:
+            logger.info_once(
+                "MORI AITER SBO v1 active: shared side stream and tile-signaled combine"
+            )
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        self._mori_aiter_sbo_workspace,
+                    )
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                post_dispatch_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+
+        elif sbo_overlap_dispatch_flag:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
@@ -1472,7 +1554,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             hidden_states.shape[0] > 0
-            and not sbo_enabled_flag
+            and (not sbo_enabled_flag or mori_aiter_sbo_flag)
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()

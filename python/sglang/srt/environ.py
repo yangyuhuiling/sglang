@@ -1109,6 +1109,12 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    # Experimental gfx950 DSV4 MORI+AITER SBO pipeline. AITER publishes
+    # sorted-M tile completion and MORI starts FP8-blockwise combine-send as
+    # soon as every route contributing to a recv row is ready.
+    SGLANG_OPT_MORI_AITER_SBO = EnvBool(False)
+    # Number of MORI combine blocks launched early to consume ready rows.
+    SGLANG_OPT_MORI_AITER_SBO_COMBINE_BLOCKS = EnvInt(8)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.

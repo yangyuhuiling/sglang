@@ -1185,6 +1185,12 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         for inner in self._inners:
             inner.set_quant_config(quant_config)
 
+    def supports_mori_aiter_sbo_v1(self) -> bool:
+        return len(self._inners) == 1 and all(
+            getattr(inner, "supports_mori_aiter_sbo_v1", lambda: False)()
+            for inner in self._inners
+        )
+
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):

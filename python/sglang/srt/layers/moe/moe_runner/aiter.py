@@ -234,7 +234,10 @@ class AiterRunnerCore(MoeRunnerCore):
                 "supports fused_moe no_combine output."
             )
 
+        down_overlap = running_state.get("down_gemm_overlap_args")
         if runner_input.hidden_states.shape[0] == 0:
+            if down_overlap is not None and getattr(down_overlap, "abi_version", 0) == 1:
+                down_overlap.start_event.record()
             if self.config.no_combine:
                 topk = runner_input.topk_ids.shape[-1]
                 hidden_size = runner_input.hidden_states.shape[-1]
@@ -290,6 +293,13 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        if down_overlap is not None and getattr(down_overlap, "abi_version", 0) == 1:
+            extra["sbo_args"] = {
+                "route_tiles": down_overlap.route_tiles,
+                "tile_state": down_overlap.tile_state,
+                "expected_n_tiles": down_overlap.expected_n_tiles,
+                "start_event": down_overlap.start_event,
+            }
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
