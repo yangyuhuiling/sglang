@@ -1430,8 +1430,8 @@ class Envs:
     # cco's fused GEMM+reduce-scatter, which overlaps the scatter with the GEMM.
     # Measured 1297us against 1617 per layer at [16384, 7168] K=2048 on 8 ranks.
     # Off by default: it needs a mori built with BUILD_CCO_SDMA=ON, a ~700 MiB
-    # symmetric window outside torch's allocator, and it only engages when M is a
-    # multiple of tp_size*128 (i.e. full prefill chunks).
+    # symmetric window outside torch's allocator, and it only engages for large
+    # M (ragged M is zero-padded up to a multiple of tp_size*128).
     SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
     # Directory holding mori's fused GEMM+AR kernels (its `benchmark/cco/flydsl`).
     # They are not part of the installed mori package, so the path is explicit.

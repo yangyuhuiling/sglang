@@ -2,17 +2,16 @@
 """Fused GEMM + all-reduce for DSV4 ``wo_b`` on ROCm gfx950, via mori cco.
 
 ``wo_b`` is a ``RowParallelLinear``, so today it runs a block-scale fp8 GEMM and
-then an NCCL all-reduce of the ``[M, hidden]`` result. At the production prefill
-shape -- ``[16384, 7168]`` with K=2048 on 8x MI355X -- the trace says that pair
-costs 1491.3us per layer, of which the collective is 1143.3.
+then an NCCL all-reduce of the ``[M, hidden]`` result. The two can overlap:
+mori's fused kernel writes each destination's row band straight into a symmetric
+window and, as soon as a band's tiles are done, hands it to the SDMA copy
+engines; the reduce and all-gather then run as their own kernels.
 
-The two can overlap. mori's fused kernel writes each destination's row band
-straight into a symmetric window and, as soon as a band's tiles are done, hands
-it to the SDMA copy engines; the reduce and all-gather then run as their own
-kernels. Measured 1146.2us for the same layer, i.e. **345us saved**, and the
-decomposition says essentially all of it is the overlap: the GEMM alone is 3.9%
-*slower* than aiter's blockscale kernel and the collective alone only 5.9%
-faster than NCCL.
+At ``[16384, 7168]`` K=2048 on 8x MI355X the pair costs 1419.5us and the fused
+kernel 1144.3, i.e. **-19.4%**. Essentially all of it is the overlap: the same
+pipeline unfused is 1462.8us, and our GEMM alone (372.7) matches aiter's
+blockscale kernel (374.4). In-server the pair goes 1617us -> 1297 per layer,
+which is -19.0ms over a 20000-token prefill.
 
 Prerequisites, all of which this module checks rather than assumes:
 
@@ -25,10 +24,11 @@ Prerequisites, all of which this module checks rather than assumes:
 * ``SGLANG_OPT_FUSED_WO_B_AR_DIR`` pointing at mori's ``benchmark/cco/flydsl``. The
   kernels are not part of the installed package, so the path is explicit.
 
-Only full prefill chunks engage: M must be a multiple of ``tp_size * 128``,
-which keeps this to one compiled kernel. Everything else -- decode, ragged
-tails, small batches -- falls back to the ordinary path, and that is expected
-rather than a failure.
+The fused epilogue pushes a whole ``BLOCK_M`` row band to one destination, so a
+destination's row slice has to be a whole number of bands: M must be a multiple
+of ``tp_size * 128``. Ragged M is zero-padded up to that, which costs GEMM rows
+and buys the overlap -- see ``_MIN_PAD_FILL``. Decode and small batches still
+fall back to the ordinary path, and that is expected rather than a failure.
 """
 
 from __future__ import annotations
@@ -51,6 +51,23 @@ _BLOCK_M = 128
 _BLOCK_N = 256
 #: fp8 block-scale group along K, fixed by the model's quantiser and the kernel.
 _SCALE_BK = 128
+
+#: Smallest padded M worth fusing. Measured at ``[*, 7168] K=2048`` on 8 ranks
+#: against the aiter GEMM + NCCL pair the model runs today: 1024 -2.6%, 2048
+#: -7.8%, 4096 -12.3%, 8192 -15.7%, 16384 -19.4%. At 1024 a destination gets a
+#: single row band, so there is nothing to overlap and the fused kernel is 1.2%
+#: *slower* than the same pipeline unfused.
+_MIN_FUSED_M = 4096
+#: Padding buys the overlap and costs GEMM rows, so the fill ratio has to clear
+#: the gain at the padded size. 0.88 is break-even at ``_MIN_FUSED_M`` (12%
+#: more rows against a 12.3% gain) and increasingly safe above it. Measured:
+#: M=3616 padded to 4096 is 342.1us against 371.4 for the unfused pair.
+_MIN_PAD_FILL = 0.88
+#: Pushes per destination, the overlap mechanism itself: with one chunk a
+#: destination's tile counter only fires when its whole slice is done, which
+#: under the rotated tile order is the end of the GEMM, so nothing overlaps.
+#: 8 is the measured plateau (1291.7us at 1, 1146.2 at 8).
+_MAX_CHUNKS = 8
 
 _state: Optional[_FusedWoB] = None
 _disabled = False
@@ -136,6 +153,7 @@ class _FusedWoB:
         reqs.sdma_queue_count = 1
         self.dev_comm = self.comm.create_dev_comm(reqs)
         self._cache: dict[int, tuple] = {}
+        self._pad_in: Optional[torch.Tensor] = None
         logger.info(
             "mori fused wo_b: window %.0f MiB, tp=%d, M<=%d, N=%d, K=%d",
             window_bytes / 2**20,
@@ -151,7 +169,7 @@ class _FusedWoB:
             m=m,
             n=self.n,
             recv_slots=self.world_size,
-            counter_chunks=8,
+            counter_chunks=_counter_chunks(m, self.world_size),
         )
         cfg.validate()
         return cfg
@@ -191,6 +209,22 @@ class _FusedWoB:
         self._cache[m] = hit
         return hit
 
+    def pad_rows(self, x: torch.Tensor, m_pad: int) -> torch.Tensor:
+        """Zero-extend ``x`` to ``m_pad`` rows, in a buffer reused across calls.
+
+        A GEMM row and a reduce-scatter row both depend only on the same input
+        row, so the added rows produce zeros that the caller slices off; padding
+        before the quantiser is what keeps the scale's column-major ``[K/128, M]``
+        layout intact without touching it.
+        """
+        m, k = x.shape
+        if self._pad_in is None or self._pad_in.shape[0] < m_pad:
+            self._pad_in = torch.zeros((m_pad, k), dtype=x.dtype, device=x.device)
+        buf = self._pad_in[:m_pad]
+        buf[:m].copy_(x)
+        buf[m:].zero_()
+        return buf
+
     def run(self, q_input, x_scale_raw, weight, weight_scale) -> torch.Tensor:
         """One fused GEMM + all-reduce; returns a view of the window's output."""
         m = q_input.shape[0]
@@ -218,16 +252,44 @@ class _FusedWoB:
         return out
 
 
+def _padded_m(m: int, world_size: int) -> int:
+    """M rounded up to a whole number of BLOCK_M row bands per destination."""
+    granule = world_size * _BLOCK_M
+    return (m + granule - 1) // granule * granule
+
+
+def _counter_chunks(m_pad: int, world_size: int) -> int:
+    """Chunks must divide the row bands per destination, which at small M is
+    fewer than ``_MAX_CHUNKS``; take the largest divisor rather than failing."""
+    bands = m_pad // (world_size * _BLOCK_M)
+    return max(c for c in range(1, min(_MAX_CHUNKS, bands) + 1) if bands % c == 0)
+
+
+def _window_m_max(m_pad: int, world_size: int) -> int:
+    """Rows the symmetric window is sized for.
+
+    Taken from the chunked-prefill limit rather than the first request seen, so
+    a short prompt arriving first cannot fix a window too small for a full chunk
+    later -- the window cannot grow once allocated.
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    limit = get_global_server_args().chunked_prefill_size
+    if limit is not None and limit > 0:
+        return max(m_pad, _padded_m(limit, world_size))
+    return m_pad
+
+
 def _eligible(m: int, n: int, k: int, world_size: int) -> bool:
-    return (
-        world_size >= 2
-        and world_size <= 8
-        # A destination's row slice has to be a whole number of BLOCK_M tiles.
-        and m % (world_size * _BLOCK_M) == 0
+    if not (
+        2 <= world_size <= 8
         and n % _BLOCK_N == 0
         and k % _SCALE_BK == 0
         and n % _SCALE_BK == 0
-    )
+    ):
+        return False
+    m_pad = _padded_m(m, world_size)
+    return m_pad >= _MIN_FUSED_M and m >= _MIN_PAD_FILL * m_pad
 
 
 def fused_wo_b_available() -> bool:
@@ -264,20 +326,26 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
     if not _eligible(m, n, k, world_size):
         return None
 
+    m_pad = _padded_m(m, world_size)
     try:
         if _state is None:
             _state = _FusedWoB(
-                envs.SGLANG_OPT_FUSED_WO_B_AR_DIR.get(), m_max=m, n=n, k=k
+                envs.SGLANG_OPT_FUSED_WO_B_AR_DIR.get(),
+                m_max=_window_m_max(m_pad, world_size),
+                n=n,
+                k=k,
             )
-        if m > _state.m_max or n != _state.n or k != _state.k:
+        if m_pad > _state.m_max or n != _state.n or k != _state.k:
             return None
+        x_in = x if m_pad == m else _state.pad_rows(x, m_pad)
         # Same quantisation the unfused path does. transpose_scale=True makes
         # the quantiser write the group scale in physical [K/128, M] order,
         # which is exactly what the kernel indexes.
         q_input, x_scale = aiter_per1x128_quant(
-            x, quant_dtype=aiter.dtypes.fp8, transpose_scale=True
+            x_in, quant_dtype=aiter.dtypes.fp8, transpose_scale=True
         )
         out = _state.run(q_input, x_scale, layer.weight, layer.weight_scale_inv)
+        out = out[:m]
     except Exception as err:  # noqa: BLE001 - one failure disables the path
         _disabled = True
         logger.warning(
