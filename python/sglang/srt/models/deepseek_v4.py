@@ -96,6 +96,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -1868,7 +1869,15 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        o, _ = self.wo_b(o.flatten(1))
+        o_flat = o.flatten(1)
+        # ROCm gfx950 TP-only: wo_b's GEMM and its all-reduce can overlap. The
+        # helper returns None whenever it does not apply -- decode, ragged
+        # chunks, no SDMA -- and disables itself for the process on any failure.
+        fused_o = fused_wo_b(self.wo_b, o_flat)
+        if fused_o is not None:
+            o = fused_o
+        else:
+            o, _ = self.wo_b(o_flat)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
