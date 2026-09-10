@@ -1551,6 +1551,18 @@ class Envs:
     # tuned batched_gemm_bf16 (gfx95). ON on ROCm, OFF elsewhere; the call sites also
     # require SGLANG_USE_AITER on gfx95. Set False to force the einsum.
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(_default_hip)
+    # ROCm gfx950 TP-only: replace wo_b's `GEMM then all-reduce` pair with mori
+    # cco's fused GEMM+reduce-scatter, which overlaps the scatter with the GEMM.
+    # Measured 1297us against 1617 per layer at [16384, 7168] K=2048 on 8 ranks.
+    # Off by default: it needs a mori built with BUILD_CCO_SDMA=ON, a ~700 MiB
+    # symmetric window outside torch's allocator, and it only engages when M is a
+    # multiple of tp_size*128 (i.e. full prefill chunks).
+    SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
+    # Directory holding mori's fused GEMM+AR kernels (its `benchmark/cco/flydsl`).
+    # They are not part of the installed mori package, so the path is explicit.
+    SGLANG_OPT_FUSED_WO_B_AR_DIR = EnvStr("")
+    # Debug: run both the fused and the unfused wo_b and log their relative L2.
+    SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)

@@ -116,6 +116,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -2572,10 +2573,25 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
-        o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
-            skip_all_reduce=mhc is not None,
-        )
+        # ROCm gfx950 TP-only: wo_b's GEMM and its all-reduce can overlap. The
+        # helper returns None whenever it does not apply -- decode, ragged
+        # chunks, no SDMA -- and disables itself for the process on any failure.
+        #
+        # It cannot serve the MHC path, and that is a correctness constraint
+        # rather than a missing feature: fusing *performs* the all-reduce, where
+        # this path deliberately skips it and folds it into all_reduce_mhc_norm.
+        fused_o = None
+        if mhc is None and isinstance(o, torch.Tensor):
+            fused_o = fused_wo_b(self.wo_b, o.flatten(1))
+        if fused_o is not None:
+            o = fused_o
+        else:
+            # A non-Tensor o is the gfx950 wo_a fork's [T, G * R] on wo_b's fp8
+            # grid, which wo_b takes as-is.
+            o, _ = self.wo_b(
+                o.flatten(1) if isinstance(o, torch.Tensor) else o,
+                skip_all_reduce=mhc is not None,
+            )
         if mhc is not None and _is_hip:
             _hip.apply_attention_mhc(o, mhc)
         elif mhc is not None:
