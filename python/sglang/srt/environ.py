@@ -1433,9 +1433,6 @@ class Envs:
     # symmetric window outside torch's allocator, and it only engages for large
     # M (ragged M is zero-padded up to a multiple of tp_size*128).
     SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
-    # Directory holding mori's fused GEMM+AR kernels (its `benchmark/cco/flydsl`).
-    # They are not part of the installed mori package, so the path is explicit.
-    SGLANG_OPT_FUSED_WO_B_AR_DIR = EnvStr("")
     # Debug: run both the fused and the unfused wo_b and log their relative L2.
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
