@@ -1558,6 +1558,13 @@ class Envs:
     # symmetric window outside torch's allocator, and it only engages for large
     # M (ragged M is zero-padded up to a multiple of tp_size*128).
     SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
+    # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
+    # halving its bytes. That leg is ~40% of a fused layer and already runs at
+    # the xGMI ceiling, so it is worth about -10% on the layer -- but it costs
+    # accuracy: relL2 goes from 2.35e-3 to 2.49e-2 at the model's shape, which
+    # is e4m3's 3-bit mantissa and not a granularity that can be tuned away. It
+    # also needs a larger window (812 MiB against 700) for the staging region.
+    SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER = EnvBool(False)
     # Debug: run both the fused and the unfused wo_b and log their relative L2.
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
