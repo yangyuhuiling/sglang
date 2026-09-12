@@ -107,6 +107,9 @@ class _FusedWoB:
         )
         self.comm = self._comm_ctx.__enter__()
         try:
+            # gather_transport defaults to the LSA pull, which widens the fp8
+            # on the way in instead of in a second kernel: 957us against SDMA's
+            # 1019 on the fused layer.
             self.op = GemmAllReduceOp(
                 self.comm, n=n, k=k, m_max=m_max, gather_dtype=gather_dtype
             )
