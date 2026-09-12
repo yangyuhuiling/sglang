@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 #: single row band, so there is nothing to overlap and the fused kernel is 1.2%
 #: *slower* than the same pipeline unfused.
 _MIN_FUSED_M = 4096
+#: Same threshold with the fp8 gather on, where it has to be higher. The two
+#: conversion kernels are a fixed cost against a transfer that shrinks with M,
+#: so fp8 only starts paying once the transfer is big enough to dominate them.
+#: Measured on the fused path at ``[*, 7168] K=2048``, fp8 against bf16:
+#: M=4096 +2.3% (*slower*), M=8192 -5.5%, M=16384 -9.6%.
+_MIN_FUSED_M_FP8_GATHER = 8192
 #: Padding buys the overlap and costs GEMM rows, so the fill ratio has to clear
 #: the gain at the padded size. 0.88 is break-even at ``_MIN_FUSED_M`` (12%
 #: more rows against a 12.3% gain) and increasingly safe above it. Measured:
@@ -87,8 +93,11 @@ class _FusedWoB:
         # The window is VMM memory outside torch's allocator, so the run has to
         # leave room for it (lower --mem-fraction-static). Sized from m_max, and
         # it cannot grow afterwards.
+        gather_dtype = (
+            "fp8" if envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.get() else "bf16"
+        )
         window_bytes = GemmAllReduceOp.window_bytes_for(
-            self.world_size, m_max=m_max, n=n
+            self.world_size, m_max=m_max, n=n, gather_dtype=gather_dtype
         )
         self._comm_ctx = Communicator.init(
             self.world_size,
@@ -98,7 +107,9 @@ class _FusedWoB:
         )
         self.comm = self._comm_ctx.__enter__()
         try:
-            self.op = GemmAllReduceOp(self.comm, n=n, k=k, m_max=m_max)
+            self.op = GemmAllReduceOp(
+                self.comm, n=n, k=k, m_max=m_max, gather_dtype=gather_dtype
+            )
         except Exception:
             # The communicator holds a VMM reservation the whole process pays
             # for. Half-constructing this object and leaving it open makes the
@@ -107,12 +118,13 @@ class _FusedWoB:
             self._comm_ctx.__exit__(None, None, None)
             raise
         logger.info(
-            "mori fused wo_b: window %.0f MiB, tp=%d, M<=%d, N=%d, K=%d",
+            "mori fused wo_b: window %.0f MiB, tp=%d, M<=%d, N=%d, K=%d, gather=%s",
             self.op.window_bytes / 2**20,
             self.world_size,
             m_max,
             n,
             k,
+            gather_dtype,
         )
 
     def pad_rows(self, x: torch.Tensor, m_pad: int) -> torch.Tensor:
@@ -150,8 +162,13 @@ def _eligible(m: int, n: int, k: int, world_size: int) -> bool:
 
     if not supports(m, n, k, world_size):
         return False
+    floor = (
+        _MIN_FUSED_M_FP8_GATHER
+        if envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.get()
+        else _MIN_FUSED_M
+    )
     m_pad = padded_m(m, world_size)
-    return m_pad >= _MIN_FUSED_M and m >= _MIN_PAD_FILL * m_pad
+    return m_pad >= floor and m >= _MIN_PAD_FILL * m_pad
 
 
 def fused_wo_b_available() -> bool:
