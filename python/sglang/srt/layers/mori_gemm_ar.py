@@ -82,6 +82,7 @@ _MIN_PAD_FILL = 0.88
 _state: Optional[_FusedWoB] = None
 _disabled = False
 _warned_layout = False
+_warned_reject = False
 _logged_config = False
 
 
@@ -290,7 +291,22 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
         # the unfused path's 3.26.
         out = _state.run(q_input, x_scale.reshape(-1), weight, layer.weight_scale_inv)
         out = out[:m]
-    except Exception as err:  # noqa: BLE001 - one failure disables the path
+    except ValueError as err:
+        # A shape or contract rejection is about *this call*, not about the
+        # path. Disabling the process on one would be a standing hazard: the op
+        # raises ValueError for an M it cannot serve, and a server's M changes
+        # with every batch, so one unlucky shape used to switch the whole
+        # optimisation off for good.
+        global _warned_reject
+        if not _warned_reject:
+            _warned_reject = True
+            logger.warning(
+                "mori fused wo_b declined a call and fell back for it; further "
+                "declines are silent: %s",
+                err,
+            )
+        return None
+    except Exception as err:  # noqa: BLE001 - anything else is not per-call
         _disabled = True
         logger.warning(
             "mori fused wo_b failed and is disabled for this process; "
