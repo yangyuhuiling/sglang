@@ -11,7 +11,27 @@ At ``[16384, 7168]`` K=2048 on 8x MI355X the pair costs 1419.5us and the fused
 kernel 1146.2, i.e. **-19.4%**. Essentially all of it is the overlap: the same
 pipeline unfused is 1465.9us, and the GEMM alone is 369.4. In-server, over one
 20000-token prefill captured with the same warm-up and flush on both sides, GPU
-busy time goes 1101.9ms -> 1071.7, i.e. **-30.2ms / -2.7%**.
+busy goes **1095.5ms -> 1021.0, -74.5ms / -6.8%** (means of three runs each;
+the request's own wall time, 1.1854s -> 1.0975, agrees).
+
+The fp8 gather does **not** pay here, which is worth stating because the layer
+benchmark says the opposite. Same protocol, GPU busy:
+
+    bf16 wire            1021.0ms   (1018.7 1025.1 1019.2)
+    fp8, SDMA push       1026.5     (1025.9 1027.1)
+    fp8, LSA pull        1049.3     (1048.3 1050.2)
+
+The layer benchmark has fp8/lsa at 949us against bf16's 1149 at the model shape,
+so it should have been the best of the three. The likely difference is rank
+skew: a pull needs the peer's slice to be finished at the moment it reads, while
+a push lets each producer send as soon as its own band is done. The benchmark
+runs every rank in lockstep on an idle box; a real prefill does not. Hence
+``SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT`` defaults to ``sdma`` here while
+mori's op defaults to ``lsa`` -- the op's default is right for the benchmark it
+was measured in.
+
+So the fp8 wire stays off: it buys nothing end to end and costs relL2 2.5e-2
+against a bf16 wire that is exact through the collective.
 
 Prerequisites, all of which this module checks rather than assumes:
 
@@ -37,6 +57,7 @@ fall back to the ordinary path, and that is expected rather than a failure.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -51,12 +72,17 @@ logger = logging.getLogger(__name__)
 #: single row band, so there is nothing to overlap and the fused kernel is 1.2%
 #: *slower* than the same pipeline unfused.
 _MIN_FUSED_M = 4096
-#: Same threshold with the fp8 gather on, where it has to be higher. The two
-#: conversion kernels are a fixed cost against a transfer that shrinks with M,
-#: so fp8 only starts paying once the transfer is big enough to dominate them.
-#: Measured on the fused path at ``[*, 7168] K=2048``, fp8 against bf16:
-#: M=4096 +2.3% (*slower*), M=8192 -5.5%, M=16384 -9.6%.
-_MIN_FUSED_M_FP8_GATHER = 8192
+#: The fp8 gather used to need a higher floor: with the SDMA transport its two
+#: conversion kernels were a fixed cost against a transfer that shrinks with M,
+#: so it was 2.3% *slower* at M=4096 and only paid from 8192 up. The LSA pull
+#: removed that -- it widens on the way in, so there is no second kernel and no
+#: re-read of the landed fp8 -- and fp8 now wins wherever fusing does at all.
+#: Measured on the fused path at ``[*, 7168] K=2048``, fp8/lsa against bf16:
+#: M=4096 -7.3% (335.8 -> 311.3us), M=8192 -13.8% (593.7 -> 512.0).
+#:
+#: Keeping 8192 is not merely conservative, it is a loss: a chunk between the
+#: two floors takes neither wire and falls back to NCCL entirely.
+_MIN_FUSED_M_FP8_GATHER = _MIN_FUSED_M
 #: Padding buys the overlap and costs GEMM rows, so the fill ratio has to clear
 #: the gain at the padded size. 0.88 is break-even at ``_MIN_FUSED_M`` (12%
 #: more rows against a 12.3% gain) and increasingly safe above it. Measured:
@@ -107,11 +133,19 @@ class _FusedWoB:
         )
         self.comm = self._comm_ctx.__enter__()
         try:
-            # gather_transport defaults to the LSA pull, which widens the fp8
-            # on the way in instead of in a second kernel: 957us against SDMA's
-            # 1019 on the fused layer.
+            # Which way the fp8 gather moves. The LSA pull wins the layer
+            # benchmark (949us against SDMA's 962 at the model shape) and loses
+            # in the server (1049.3ms of GPU busy against 1026.5), so the
+            # default differs from mori's on purpose -- see the module docstring.
             self.op = GemmAllReduceOp(
-                self.comm, n=n, k=k, m_max=m_max, gather_dtype=gather_dtype
+                self.comm,
+                n=n,
+                k=k,
+                m_max=m_max,
+                gather_dtype=gather_dtype,
+                gather_transport=os.environ.get(
+                    "SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT", "sdma"
+                ),
             )
         except Exception:
             # The communicator holds a VMM reservation the whole process pays
@@ -144,9 +178,9 @@ def _window_m_max(m_pad: int, world_size: int) -> int:
     a short prompt arriving first cannot fix a window too small for a full chunk
     later -- the window cannot grow once allocated.
     """
-    from sglang.srt.server_args import get_global_server_args
-
     from mori.ops.gemm_ar import padded_m
+
+    from sglang.srt.server_args import get_global_server_args
 
     limit = get_global_server_args().chunked_prefill_size
     if limit is not None and limit > 0:
@@ -194,11 +228,10 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
         return None
 
     import aiter
+    from mori.ops.gemm_ar import padded_m
 
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.quantization.fp8_utils import aiter_per1x128_quant
-
-    from mori.ops.gemm_ar import padded_m
 
     m, k = x.shape
     n = layer.weight.shape[0]
