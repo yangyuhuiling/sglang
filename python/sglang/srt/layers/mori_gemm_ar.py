@@ -11,27 +11,18 @@ At ``[16384, 7168]`` K=2048 on 8x MI355X the pair costs 1419.5us and the fused
 kernel 1146.2, i.e. **-19.4%**. Essentially all of it is the overlap: the same
 pipeline unfused is 1465.9us, and the GEMM alone is 369.4. In-server, over one
 20000-token prefill captured with the same warm-up and flush on both sides, GPU
-busy goes **1095.5ms -> 1021.0, -74.5ms / -6.8%** (means of three runs each;
-the request's own wall time, 1.1854s -> 1.0975, agrees).
+busy goes **1096.0ms -> 1070.3, -25.7ms / -2.3%**, and the fp8 gather takes it
+to **1041.2, -5.0%**. The request's own wall time agrees: 1.1969s -> 1.1728 ->
+1.1385. The layer-level win is much larger than the end-to-end one because
+`wo_b` is about 12% of the profile.
 
-The fp8 gather does **not** pay here, which is worth stating because the layer
-benchmark says the opposite. Same protocol, GPU busy:
-
-    bf16 wire            1021.0ms   (1018.7 1025.1 1019.2)
-    fp8, SDMA push       1026.5     (1025.9 1027.1)
-    fp8, LSA pull        1049.3     (1048.3 1050.2)
-
-The layer benchmark has fp8/lsa at 949us against bf16's 1149 at the model shape,
-so it should have been the best of the three. The likely difference is rank
-skew: a pull needs the peer's slice to be finished at the moment it reads, while
-a push lets each producer send as soon as its own band is done. The benchmark
-runs every rank in lockstep on an idle box; a real prefill does not. Hence
-``SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT`` defaults to ``sdma`` here while
-mori's op defaults to ``lsa`` -- the op's default is right for the benchmark it
-was measured in.
-
-So the fp8 wire stays off: it buys nothing end to end and costs relL2 2.5e-2
-against a bf16 wire that is exact through the collective.
+**Check that mori was built with `BUILD_CCO_SDMA=ON` before believing any
+measurement of this path.** With it off every put silently does nothing: the
+all-reduce returns mostly the local slice, the model still answers, and the
+fused path looks *faster* than it is because it is not moving any data. Measured
+that way it reads -6.8% instead of -2.3%, and the fp8 pull -- the only leg that
+does not go through SDMA -- looks like the slowest of the three instead of the
+fastest. Perplexity is what catches it: 862511 against 3.26 on the same text.
 
 Prerequisites, all of which this module checks rather than assumes:
 
@@ -90,6 +81,38 @@ _MIN_FUSED_M_FP8_GATHER = _MIN_FUSED_M
 _MIN_PAD_FILL = 0.88
 _state: Optional[_FusedWoB] = None
 _disabled = False
+_warned_layout = False
+_logged_config = False
+
+
+def _shuffled_once():
+    global _logged_config
+    if _logged_config:
+        return True
+    _logged_config = True
+    return False
+
+
+def _fused_weight(layer):
+    """The weight to hand the op, or None if this layer cannot be fused.
+
+    The op requires B preshuffled. sglang does that at load time, but only when
+    the aiter block-fp8 linear is what consumes the weight and the tuned triton
+    GEMM does not cover the shape, recording it as ``layer.aiter_bpreshuffled``.
+    Handing the row-major one to the op does not fail -- it returns an
+    uncorrelated result -- so check rather than assume.
+    """
+    global _warned_layout
+    if getattr(layer, "aiter_bpreshuffled", False):
+        return layer.weight
+    if not _warned_layout:
+        _warned_layout = True
+        logger.warning(
+            "mori fused wo_b: this layer's weight is not aiter-preshuffled "
+            "(shape %s), which the fused kernel requires; not fusing.",
+            tuple(layer.weight.shape),
+        )
+    return None
 
 
 class _FusedWoB:
@@ -133,10 +156,10 @@ class _FusedWoB:
         )
         self.comm = self._comm_ctx.__enter__()
         try:
-            # Which way the fp8 gather moves. The LSA pull wins the layer
-            # benchmark (949us against SDMA's 962 at the model shape) and loses
-            # in the server (1049.3ms of GPU busy against 1026.5), so the
-            # default differs from mori's on purpose -- see the module docstring.
+            # Which way the fp8 gather moves. The LSA pull widens on the way in
+            # instead of in a second kernel, and it wins in both places: 951us
+            # against SDMA's 1011 on the layer, 1041.2ms of GPU busy against
+            # 1052.1 in the server.
             self.op = GemmAllReduceOp(
                 self.comm,
                 n=n,
@@ -144,7 +167,7 @@ class _FusedWoB:
                 m_max=m_max,
                 gather_dtype=gather_dtype,
                 gather_transport=os.environ.get(
-                    "SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT", "sdma"
+                    "SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT", "lsa"
                 ),
             )
         except Exception:
@@ -256,7 +279,16 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
         q_input, x_scale = aiter_per1x128_quant(
             x_in, quant_dtype=aiter.dtypes.fp8, transpose_scale=True
         )
-        out = _state.run(q_input, x_scale, layer.weight, layer.weight_scale_inv)
+        weight = _fused_weight(layer)
+        if weight is None:
+            return None
+        # Flat, explicitly. transpose_scale=True writes the group scale in
+        # K/128-major order but keeps the (M, K/128) shape, so the tensor's shape
+        # does not describe its contents and the op refuses to guess -- see
+        # _flatten_a_scale. Passing the 2-D tensor transposes it and returns an
+        # answer that is wrong by relL2 0.36, which is perplexity 862511 against
+        # the unfused path's 3.26.
+        out = _state.run(q_input, x_scale.reshape(-1), weight, layer.weight_scale_inv)
         out = out[:m]
     except Exception as err:  # noqa: BLE001 - one failure disables the path
         _disabled = True
@@ -268,8 +300,33 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
         return None
 
     if envs.SGLANG_DEBUG_FUSED_WO_B_AR.get():
+        if not _shuffled_once():
+            o = _state.op
+            logger.info(
+                "mori fused wo_b config: rank=%d/%d m_max=%d n=%d k=%d queues=%d "
+                "gather=%s/%s m=%d m_pad=%d",
+                o.rank,
+                o.world_size,
+                o.m_max,
+                o.n,
+                o.k,
+                o.sdma_queues,
+                o.gather_dtype,
+                o.gather_transport,
+                m,
+                m_pad,
+            )
         out = out.clone()
+        # Same inputs, immediately again: if the two disagree the server context
+        # is racing the collective; if they agree the op is deterministic here
+        # and merely disagrees with the reference.
+        again = _state.run(
+            q_input, x_scale.reshape(-1), weight, layer.weight_scale_inv
+        )[:m].clone()
+        self_rel = ((out.float() - again.float()).norm() / out.float().norm()).item()
         ref, _ = layer(x)
         rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
-        logger.info("mori fused wo_b check: M=%d relL2=%.3e", m, rel)
+        logger.info(
+            "mori fused wo_b check: M=%d relL2=%.3e self_rel=%.3e", m, rel, self_rel
+        )
     return out
