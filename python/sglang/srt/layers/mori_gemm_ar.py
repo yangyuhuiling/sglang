@@ -83,6 +83,37 @@ _state: Optional[_FusedWoB] = None
 _disabled = False
 _warned_layout = False
 _warned_reject = False
+
+#: Log what M this layer is actually handed, as a periodic histogram.
+#:
+#: M is the token count of one forward, not of one request, so whether the fused
+#: path engages depends on how the scheduler batches -- which is not something to
+#: infer from the client's concurrency. Set
+#: SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG=1 to find out.
+_SHAPE_LOG = os.environ.get("SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG") == "1"
+_shape_hist: dict = {}
+_shape_calls = 0
+#: 61 wo_b calls make one forward, so this logs roughly every ten of them.
+_SHAPE_EVERY = 610
+
+
+def _record_shape(m, eligible, world_size):
+    global _shape_calls
+    from mori.ops.gemm_ar import padded_m
+
+    key = (m, padded_m(m, world_size), bool(eligible))
+    _shape_hist[key] = _shape_hist.get(key, 0) + 1
+    _shape_calls += 1
+    if _shape_calls >= _SHAPE_EVERY:
+        _shape_calls = 0
+        items = sorted(_shape_hist.items(), key=lambda kv: -kv[1])
+        logger.info(
+            "wo_b shapes: %s",
+            " ".join(f"M={m}/pad{p}{'+' if e else '-'}x{c}" for (m, p, e), c in items),
+        )
+        _shape_hist.clear()
+
+
 _logged_config = False
 
 
@@ -171,6 +202,16 @@ class _FusedWoB:
                     "SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT", "lsa"
                 ),
             )
+            # Prove the collective moves bytes before serving a single token.
+            # A mori built without BUILD_CCO_SDMA=ON -- the default, and what the
+            # CI image ships -- compiles the puts out: every kernel still
+            # launches, nothing moves, the all-reduce returns mostly the local
+            # slice, and the model still answers fluently while being wrong.
+            # It also measures *faster* that way, which is how a whole
+            # end-to-end campaign came out at -6.8% instead of -2.3%. This costs
+            # one collective at m_max, on kernels the first real call compiles
+            # anyway.
+            self.op.self_test()
         except Exception:
             # The communicator holds a VMM reservation the whole process pays
             # for. Half-constructing this object and leaving it open makes the
@@ -260,7 +301,10 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
     m, k = x.shape
     n = layer.weight.shape[0]
     world_size = get_tp_group().world_size
-    if not _eligible(m, n, k, world_size):
+    eligible = _eligible(m, n, k, world_size)
+    if _SHAPE_LOG:
+        _record_shape(m, eligible, world_size)
+    if not eligible:
         return None
 
     m_pad = padded_m(m, world_size)
