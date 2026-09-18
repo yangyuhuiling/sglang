@@ -7,23 +7,32 @@ kernel writes each destination's row band straight into a symmetric window and,
 as soon as a band's tiles are done, hands it to the SDMA copy engines; the
 reduce and all-gather then run as their own kernels.
 
-**Most of the win here is not the overlap**, and reading it as such would set
-the thresholds wrong. At V4.1-Flash's TP4 shape (N=5120 K=2048) three separate
-things are on offer, measured on an idle MI355X:
+**Three separate things are on offer here and they do not compose the way the
+V4-Pro numbers suggest**, so the thresholds below are measured against what
+V4.1-Flash actually runs (``mxfp8_native_blockscaled_linear`` + all-reduce)
+rather than inherited. At TP4 N=5120 K=2048 on an idle MI355X:
 
-* **The GEMM.** wo_b's tuning table picks ``hipblaslt_bf16`` at this shape.
+* **The GEMM.** wo_b's tuning table picks ``hipblaslt_bf16`` above M=8192.
   mori's mxfp8 GEMM does the whole bf16-in/bf16-out pipeline at M=16384 in
   196.0us against 281.3, **-30.3%** -- before any fusion.
-* **The fp8 all-gather wire.** Worth -15.6% on its own, i.e. without fusing at
-  all, at a cost in accuracy: relL2 2.37e-03 -> 2.31e-02.
-* **The fusion.** +1.7% at M=4096 to +5.9% at M=16384 on a bf16 wire. Not the
-  -19.4% V4-Pro sees, and the reason is arithmetic rather than a regression:
-  the GEMM is 178us against 1414us of communication, so the ceiling (hiding the
-  GEMM entirely) is 11-15% and the fusion collects about half of it. Making the
-  GEMM faster lowered this number.
+* **The fp8 all-gather wire.** -15.6% on its own, without fusing at all, at a
+  cost in accuracy: relL2 2.37e-03 -> 2.31e-02.
+* **The fusion**, which is bounded by how much GEMM there is to hide the
+  transfer behind: 178us of GEMM against 1414us of communication, so the
+  ceiling is 11-15%. Making the GEMM faster lowered it.
 
-Composed, the best configuration is 1192.1us against 1592.5 for split/bf16,
-**-25.1%**: fused-sdma with ``gather_dtype=fp8`` over the LSA pull.
+Whole-layer, against today's path, once mori pinned its launcher dispatch:
+
+    M       bf16 wire    fp8 wire
+     5120      -5.8%      -20.7%
+     8192     -19.4%      -34.1%
+    16384     -16.2%      -32.9%
+
+An earlier revision of this file read those as +11.0% / -0.5% at M=5120 and
+concluded the bf16 wire was not worth enabling. That was a property of the
+measurement, not of the wire: the fused path was spending 181.6us per call in
+FlyDSL's per-dispatch bookkeeping and was host-bound, with the GPU idle between
+phases. Both wires pay now.
 
 **Check that mori was built with `BUILD_CCO_SDMA=ON` before believing any
 measurement of this path.** With it off every put silently does nothing: the
@@ -72,45 +81,44 @@ logger = logging.getLogger(__name__)
 
 #: Smallest padded M worth fusing on a **bf16** wire.
 #:
-#: 16384 rather than V4-Pro's 4096, and the honest reading of the measurements
-#: is that this wire is not worth enabling here at all -- 16384 is where it
-#: first clears the noise, not where it starts paying. Against what runs today
-#: (``mxfp8_native_blockscaled_linear`` + NCCL) at TP4 N=5120 K=2048, by m_pad:
+#: Re-derived after mori pinned its launcher dispatch. The previous 16384 came
+#: from a measurement where the fused path paid 181.6us of FlyDSL bookkeeping in
+#: Python per call and was host-bound; "the bf16 wire is not worth it" was true
+#: of that layer and is not true of this one. Against what V4.1-Flash runs today
+#: at TP4 N=5120 K=2048, by m_pad, two runs:
 #:
-#:     m_pad  5120   +11.0%      m_pad  9216   +10.9% .. -8.5%
-#:     m_pad  8192   -0.4% .. -9.5%    m_pad 13312   -2.2% .. -2.4%
-#:     m_pad 16384  -12.2%
+#:     m_pad  1024   +16.4%      m_pad  8192   -12.2% .. -19.4%
+#:     m_pad  2048    +1.8%      m_pad  9216   -17.5% .. -20.8%
+#:     m_pad  4096    -0.9%      m_pad 13312    -5.6% ..  -8.5%
+#:     m_pad  5120   +17.0% .. -5.8%          m_pad 16384  -16.2%
 #:
-#: The spread within one m_pad is the *baseline* moving, not the fused path:
-#: today's route retunes per M bucket and swings ~20% between them (M=8200
-#: costs 943us, M=8800 costs 1133). The fusion's own contribution does not
-#: clear that, which is the arithmetic in the module docstring -- the GEMM is
-#: 178us against 1414us of communication, so the ceiling is 11-15%.
-_MIN_FUSED_M = 16384
-#: The same for the **fp8** wire, which is a different question and gets a
-#: different answer: it is consistently 15-25% below the bf16 wire, so it does
-#: clear the baseline's bucket noise. Every m_pad >= 8192 measured wins, worst
-#: case -7.4%:
+#: 8192 rather than 5120, and that costs a real -5.8% at M=5120 exactly. m_pad
+#: 5120 is not one answer: it wins at fill 1.000 and loses at 0.918 (+8.4%) and
+#: 0.820 (+17.0%), because the fused cost is fixed by the padded size while the
+#: baseline follows the true M. No fill threshold separates those from the
+#: *winning* low-fill points above (0.879 at m_pad 8192 wins -17.6%), so the
+#: floor is what has to do it.
+_MIN_FUSED_M = 8192
+#: The same for the **fp8** wire, and it is a much lower bar because that wire
+#: runs 15-25% under the bf16 one -- enough to clear the baseline's own
+#: per-bucket swing. Everything from m_pad 2048 up wins:
 #:
-#:     m_pad  8192  -16.7% .. -24.4%   m_pad 13312  -18.6% .. -18.7%
-#:     m_pad  9216   -7.4% .. -23.6%   m_pad 16384  -28.8%
+#:     m_pad  2048   -8.8%       m_pad  5120   -2.3% .. -20.7%
+#:     m_pad  3072  -12.7%       m_pad  8192  -28.1% .. -32.7%
+#:     m_pad  4096  -15.4%       m_pad 16384  -32.9%
 #:
-#: Below that it is not monotonic. m_pad 3072 and 4096 win (-9.8%, -13.0%) but
-#: **m_pad 5120 loses** (+18.7%, +8.8%, -0.5%): the fused cost jumps 510 ->
-#: 600us across that step while the baseline only goes 587 -> 603, because both
-#: are in one dot_scaled bucket and it is not compute-bound there. A single
-#: floor cannot keep 4096 and drop 5120, so this gives up the small win below
-#: rather than take an 18% regression on a band of M a server will actually hit.
-_MIN_FUSED_M_FP8_GATHER = 8192
+#: Only m_pad 1024 loses (+10.3%): one row band per destination, so there is
+#: nothing for the scatter to overlap with.
+_MIN_FUSED_M_FP8_GATHER = 2048
 #: Padding buys the overlap and costs GEMM rows, so a ragged M has to be full
 #: enough that the gain at the padded size still clears it.
 #:
-#: Note this does not bind at the floors above: the granule is
-#: ``tp_size * 256``, so at m_pad >= 8192 the fill cannot fall below
-#: (8192-1023)/8192 = 0.875 in the first place. It is a guard for a lowered
-#: floor rather than an active rule. The lowest fill measured above the floor,
-#: 0.879 at M=7200, wins -16.7% on the fp8 wire.
-_MIN_PAD_FILL = 0.85
+#: This binds on the fp8 wire and not on the bf16 one. At m_pad >= 8192 the
+#: granule (tp_size * 256) puts the worst possible fill at 0.875, above this
+#: either way; at the fp8 floor of 2048 a chunk can be half empty. 0.80 is
+#: below every fill measured -- the lowest, 0.820 at M=4200, still wins -2.3%
+#: on the fp8 wire -- and guards the range below that, which is not measured.
+_MIN_PAD_FILL = 0.80
 _state: Optional[_FusedWoB] = None
 _disabled = False
 _warned_layout = False

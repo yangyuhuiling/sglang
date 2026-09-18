@@ -83,6 +83,13 @@ def main():
     p.add_argument("-n", type=int, default=5120)
     p.add_argument("-k", type=int, default=2048)
     p.add_argument("-m", default="4096,8192,3000")
+    p.add_argument(
+        "--floor",
+        type=int,
+        default=0,
+        help="lower the eligibility floor. The floors are a profitability "
+        "judgement; correctness has to be checkable below them too.",
+    )
     args = p.parse_args()
 
     # the module reports every rejection through logger.warning, once each
@@ -113,8 +120,12 @@ def main():
         ))
     )
 
+    import sglang.srt.layers.mori_gemm_ar as mori_wo_b
     from sglang.srt.environ import envs
     from sglang.srt.layers.mori_gemm_ar import fused_wo_b
+
+    if args.floor:
+        mori_wo_b._MIN_FUSED_M = mori_wo_b._MIN_FUSED_M_FP8_GATHER = args.floor
 
     layer, _, _ = build(rank, args.n, args.k)
 
