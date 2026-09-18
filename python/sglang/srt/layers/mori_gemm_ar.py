@@ -1,20 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused GEMM + all-reduce for DSV4 ``wo_b`` on ROCm gfx950, via mori cco.
+"""Fused GEMM + all-reduce for DeepSeek-V4.1-Flash ``wo_b`` on ROCm gfx950, via mori cco.
 
-``wo_b`` is a ``RowParallelLinear``, so today it runs a block-scale fp8 GEMM and
-then an NCCL all-reduce of the ``[M, hidden]`` result. The two can overlap:
-mori's fused kernel writes each destination's row band straight into a symmetric
-window and, as soon as a band's tiles are done, hands it to the SDMA copy
-engines; the reduce and all-gather then run as their own kernels.
+``wo_b`` is a ``RowParallelLinear``, so today it runs a GEMM and then an NCCL
+all-reduce of the ``[M, hidden]`` result. The two can overlap: mori's fused
+kernel writes each destination's row band straight into a symmetric window and,
+as soon as a band's tiles are done, hands it to the SDMA copy engines; the
+reduce and all-gather then run as their own kernels.
 
-At ``[16384, 7168]`` K=2048 on 8x MI355X the pair costs 1419.5us and the fused
-kernel 1146.2, i.e. **-19.4%**. Essentially all of it is the overlap: the same
-pipeline unfused is 1465.9us, and the GEMM alone is 369.4. In-server, over one
-20000-token prefill captured with the same warm-up and flush on both sides, GPU
-busy goes **1096.0ms -> 1070.3, -25.7ms / -2.3%**, and the fp8 gather takes it
-to **1041.2, -5.0%**. The request's own wall time agrees: 1.1969s -> 1.1728 ->
-1.1385. The layer-level win is much larger than the end-to-end one because
-`wo_b` is about 12% of the profile.
+**Most of the win here is not the overlap**, and reading it as such would set
+the thresholds wrong. At V4.1-Flash's TP4 shape (N=5120 K=2048) three separate
+things are on offer, measured on an idle MI355X:
+
+* **The GEMM.** wo_b's tuning table picks ``hipblaslt_bf16`` at this shape.
+  mori's mxfp8 GEMM does the whole bf16-in/bf16-out pipeline at M=16384 in
+  196.0us against 281.3, **-30.3%** -- before any fusion.
+* **The fp8 all-gather wire.** Worth -15.6% on its own, i.e. without fusing at
+  all, at a cost in accuracy: relL2 2.37e-03 -> 2.31e-02.
+* **The fusion.** +1.7% at M=4096 to +5.9% at M=16384 on a bf16 wire. Not the
+  -19.4% V4-Pro sees, and the reason is arithmetic rather than a regression:
+  the GEMM is 178us against 1414us of communication, so the ceiling (hiding the
+  GEMM entirely) is 11-15% and the fusion collects about half of it. Making the
+  GEMM faster lowered this number.
+
+Composed, the best configuration is 1192.1us against 1592.5 for split/bf16,
+**-25.1%**: fused-sdma with ``gather_dtype=fp8`` over the LSA pull.
 
 **Check that mori was built with `BUILD_CCO_SDMA=ON` before believing any
 measurement of this path.** With it off every put silently does nothing: the
@@ -32,17 +41,20 @@ Prerequisites, all of which this module checks rather than assumes:
   all-reduce quietly produces zeros. Point ``PYTHONPATH`` at a mori built with
   the flag on.
 * ``MORI_ENABLE_SDMA=1`` at process start.
+* a layer sglang's native mxfp8 route already prepared
+  (``layer.mxfp8_native_ready``) -- see ``_fused_weight``.
 
 The kernel itself is ``mori.ops.gemm_ar.GemmAllReduceOp``, which owns the
 symmetric window, the per-M compile cache and the row padding. What stays here
-is the part that is sglang's: the TP communicator, how the window is sized, and
-whether fusing is worth it at this shape.
+is the part that is sglang's: the TP communicator, how the window is sized, the
+operand conversions, and whether fusing is worth it at this shape.
 
 The fused epilogue pushes a whole ``BLOCK_M`` row band to one destination, so a
 destination's row slice has to be a whole number of bands: M must be a multiple
-of ``tp_size * 128``. Ragged M is zero-padded up to that, which costs GEMM rows
-and buys the overlap -- see ``_MIN_PAD_FILL``. Decode and small batches still
-fall back to the ordinary path, and that is expected rather than a failure.
+of ``tp_size * 256``. That granule is mxfp8's, not a choice -- see ``_BLOCK_M``.
+Ragged M is zero-padded up to it, which costs GEMM rows and buys the overlap --
+see ``_MIN_PAD_FILL``. Decode and small batches still fall back to the ordinary
+path, and that is expected rather than a failure.
 """
 
 from __future__ import annotations
@@ -52,7 +64,8 @@ import os
 from typing import Optional
 
 import torch
-
+import triton
+import triton.language as tl
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -99,9 +112,7 @@ _SHAPE_EVERY = 610
 
 def _record_shape(m, eligible, world_size):
     global _shape_calls
-    from mori.ops.gemm_ar import padded_m
-
-    key = (m, padded_m(m, world_size), bool(eligible))
+    key = (m, _padded_m(m, world_size), bool(eligible))
     _shape_hist[key] = _shape_hist.get(key, 0) + 1
     _shape_calls += 1
     if _shape_calls >= _SHAPE_EVERY:
@@ -112,6 +123,94 @@ def _record_shape(m, eligible, world_size):
             " ".join(f"M={m}/pad{p}{'+' if e else '-'}x{c}" for (m, p, e), c in items),
         )
         _shape_hist.clear()
+
+
+#: mori's mxfp8 kernel packs a lane's four M tiles into one scale dword and
+#: picks the byte with the MFMA's opsel, which is four tiles only at BLOCK_M 256
+#: -- so a destination's row band is 256 rows here, not blockscale's 128, and M
+#: pads to a multiple of ``tp_size * 256``.
+_BLOCK_M = 256
+#: The ue8m0 group along K. Also the rows one quantiser program owns, which is
+#: what lets it write mori's packed scale layout without extra traffic.
+_QUANT_BLOCK_M = 64
+
+
+def _padded_m(m: int, world_size: int) -> int:
+    from mori.ops.gemm_ar import padded_m
+
+    return padded_m(m, world_size, _BLOCK_M)
+
+
+@triton.jit
+def _mxfp8_quant_packed_kernel(
+    x_ptr,
+    xq_ptr,
+    s_ptr,
+    M,
+    K,
+    sxm,
+    sxk,
+    sqm,
+    sqk,
+    BLOCK_M: tl.constexpr,
+):
+    """sglang's ``_mxfp8_quant_kernel`` writing mori's scale layout directly.
+
+    A variant rather than a stride argument on the original, because the layout
+    is not expressible as strides: mori wants element ``(m, kb)`` at
+    ``kb*M + (m//64)*64 + (m%16)*4 + (m%64)//16``, which permutes *within* each
+    64-row group so a lane's four M tiles land in one dword.
+
+    That permutation is free here. The destination stays inside the 64 bytes
+    this program already owns, so the store is the same cache line and only its
+    order changes -- measured bit-identical to quantising and converting
+    afterwards, and slightly faster than the stock kernel, since transposing
+    also turns a strided store into a coalesced one.
+    """
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_b * 32 + tl.arange(0, 32)
+    m_mask = offs_m < M
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk,
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30)
+    sb = tl.ceil(tl.log2(amax / 448.0)) + 127.0
+    sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
+    descale = tl.exp2(sb - 127.0)
+    xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
+    tl.store(
+        xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
+        xq,
+        mask=m_mask[:, None],
+    )
+    dst = pid_b * M + (offs_m // 64) * 64 + (offs_m % 16) * 4 + (offs_m % 64) // 16
+    tl.store(s_ptr + dst, sb.to(tl.uint8), mask=m_mask)
+
+
+def _quantize_packed(x: torch.Tensor):
+    """bf16 ``[M, K]`` -> (fp8 e4m3 values, mori's packed ue8m0 A scale)."""
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import MXFP8_VALUE_DTYPE
+
+    m, k = x.shape
+    xq = torch.empty((m, k), dtype=MXFP8_VALUE_DTYPE, device=x.device)
+    scale = torch.empty((k // 32) * m, dtype=torch.uint8, device=x.device)
+    _mxfp8_quant_packed_kernel[(triton.cdiv(m, _QUANT_BLOCK_M), k // 32)](
+        x,
+        xq,
+        scale,
+        m,
+        k,
+        x.stride(0),
+        x.stride(1),
+        xq.stride(0),
+        xq.stride(1),
+        BLOCK_M=_QUANT_BLOCK_M,
+    )
+    return xq, scale.view(torch.int32)
 
 
 _logged_config = False
@@ -125,26 +224,82 @@ def _shuffled_once():
     return False
 
 
-def _fused_weight(layer):
-    """The weight to hand the op, or None if this layer cannot be fused.
+def _fused_shape(layer):
+    """``wo_b``'s logical (N, K).
 
-    The op requires B preshuffled. sglang does that at load time, but only when
-    the aiter block-fp8 linear is what consumes the weight and the tuned triton
-    GEMM does not cover the shape, recording it as ``layer.aiter_bpreshuffled``.
-    Handing the row-major one to the op does not fail -- it returns an
-    uncorrelated result -- so check rather than assume.
+    Not ``layer.weight.shape``: ``prepare_mxfp8_native_weight`` rebinds the
+    weight to its shuffled form, ``[N/16, K/128, 2048]``, so that first axis is
+    N/16 rather than N. Reading it as N silently disqualifies every layer --
+    5120 becomes 320, ``supports`` says no because 320 is not a multiple of
+    BLOCK_N, and the path falls back without a word. The ue8m0 scale keeps the
+    logical shape, ``[N/32, K/32]``, so take it from there.
+    """
+    sn, sk = layer.weight_scale_mx_e8m0.shape
+    return sn * 32, sk * 32
+
+
+def _fused_weight(layer):
+    """The op's B operand and B scale, or None if this layer cannot be fused.
+
+    V4.1-Flash quantises 32-wide ue8m0, and sglang's own native mxfp8 route
+    already prepares almost exactly what mori wants -- ``mxfp8_native_ready``
+    means ``prepare_mxfp8_native_weight`` ran and left the shuffled fp8 bytes on
+    ``layer.weight`` and the ``[N/32, K/32]`` exponent bytes on
+    ``layer.weight_scale_mx_e8m0``. Handing over the unprepared weight does not
+    fail, it returns an uncorrelated result, so this checks rather than assumes.
+
+    Two conversions, both once per layer and cached on it:
+
+    * **The weight.** ``shuffle_mxfp8_weight`` and mori's ``preshuffle_b`` give
+      each lane the same K range and differ only in how the two 64-wide K
+      sub-blocks sit: sglang interleaves them inside a lane's 32 bytes, mori
+      keeps them as two 16-byte blocks. So the permutation below is exact --
+      verified byte-for-byte at [5120, 2048].
+    * **The B scale.** mori indexes it K-block major as int32, and the exponent
+      bytes are already at the 32x32 granularity it wants (not the per-row
+      ``[N, K/32]`` that ``tl.dot_scaled`` takes), so it is a transpose and a
+      widen.
+
+    Cached on the layer rather than recomputed: the permutation is a full copy
+    of the weight, which at 61 layers would be pointless per-call work.
     """
     global _warned_layout
-    if getattr(layer, "aiter_bpreshuffled", False):
-        return layer.weight
-    if not _warned_layout:
-        _warned_layout = True
-        logger.warning(
-            "mori fused wo_b: this layer's weight is not aiter-preshuffled "
-            "(shape %s), which the fused kernel requires; not fusing.",
-            tuple(layer.weight.shape),
-        )
-    return None
+    cached = getattr(layer, "_mori_b", None)
+    if cached is not None:
+        return cached
+
+    if not getattr(layer, "mxfp8_native_ready", False) or not hasattr(
+        layer, "weight_scale_mx_e8m0"
+    ):
+        if not _warned_layout:
+            _warned_layout = True
+            logger.warning(
+                "mori fused wo_b: this layer is not mxfp8_native_ready (weight "
+                "shape %s), which the fused kernel requires; not fusing.",
+                tuple(layer.weight.shape),
+            )
+        return None
+
+    n, k = _fused_shape(layer)
+    w = layer.weight.data.contiguous().view(torch.uint8)
+    # [N/16, K/128, 64 lanes, 2 sub-blocks, 16B] -> the two sub-blocks split out
+    b = (
+        w.reshape(n // 16, k // 128, 64, 2, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .reshape(n, k)
+        .view(layer.weight.dtype)
+    )
+    b_scale = (
+        layer.weight_scale_mx_e8m0.data.contiguous()
+        .view(torch.uint8)
+        .t()
+        .contiguous()
+        .to(torch.int32)
+        .reshape(-1)
+    )
+    layer._mori_b = (b, b_scale)
+    return layer._mori_b
 
 
 class _FusedWoB:
@@ -159,7 +314,6 @@ class _FusedWoB:
         import torch.distributed as dist
         from mori.cco import Communicator, UniqueId
         from mori.ops.gemm_ar import GemmAllReduceOp
-
         from sglang.srt.distributed import get_tp_group
 
         tp = get_tp_group()
@@ -178,7 +332,11 @@ class _FusedWoB:
             "fp8" if envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.get() else "bf16"
         )
         window_bytes = GemmAllReduceOp.window_bytes_for(
-            self.world_size, m_max=m_max, n=n, gather_dtype=gather_dtype
+            self.world_size,
+            m_max=m_max,
+            n=n,
+            block_m=_BLOCK_M,
+            gather_dtype=gather_dtype,
         )
         self._comm_ctx = Communicator.init(
             self.world_size,
@@ -197,6 +355,7 @@ class _FusedWoB:
                 n=n,
                 k=k,
                 m_max=m_max,
+                quant="mxfp8",
                 gather_dtype=gather_dtype,
                 gather_transport=os.environ.get(
                     "SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT", "lsa"
@@ -243,13 +402,11 @@ def _window_m_max(m_pad: int, world_size: int) -> int:
     a short prompt arriving first cannot fix a window too small for a full chunk
     later -- the window cannot grow once allocated.
     """
-    from mori.ops.gemm_ar import padded_m
-
     from sglang.srt.server_args import get_global_server_args
 
     limit = get_global_server_args().chunked_prefill_size
     if limit is not None and limit > 0:
-        return max(m_pad, padded_m(limit, world_size))
+        return max(m_pad, _padded_m(limit, world_size))
     return m_pad
 
 
@@ -260,16 +417,16 @@ def _eligible(m: int, n: int, k: int, world_size: int) -> bool:
     second, and stay on this side because they are measured against what the
     model runs today rather than being a property of the kernel.
     """
-    from mori.ops.gemm_ar import padded_m, supports
+    from mori.ops.gemm_ar import supports
 
-    if not supports(m, n, k, world_size):
+    if not supports(m, n, k, world_size, quant="mxfp8"):
         return False
     floor = (
         _MIN_FUSED_M_FP8_GATHER
         if envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.get()
         else _MIN_FUSED_M
     )
-    m_pad = padded_m(m, world_size)
+    m_pad = _padded_m(m, world_size)
     return m_pad >= floor and m >= _MIN_PAD_FILL * m_pad
 
 
@@ -292,14 +449,22 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
     if not fused_wo_b_available():
         return None
 
-    import aiter
-    from mori.ops.gemm_ar import padded_m
-
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Fp8GridActivation
     from sglang.srt.distributed import get_tp_group
-    from sglang.srt.layers.quantization.fp8_utils import aiter_per1x128_quant
+
+    # wo_a hands wo_b either a plain bf16 activation or an Fp8GridActivation --
+    # a bf16 tensor already rounded onto wo_b's fp8 grid, so quantising it below
+    # is lossless rather than a second rounding. Either way what the GEMM needs
+    # is the bf16 tensor.
+    if isinstance(x, Fp8GridActivation):
+        x = x.x
 
     m, k = x.shape
-    n = layer.weight.shape[0]
+    if not hasattr(layer, "weight_scale_mx_e8m0"):
+        return None
+    n, w_k = _fused_shape(layer)
+    if w_k != k:
+        return None
     world_size = get_tp_group().world_size
     eligible = _eligible(m, n, k, world_size)
     if _SHAPE_LOG:
@@ -307,7 +472,7 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
     if not eligible:
         return None
 
-    m_pad = padded_m(m, world_size)
+    m_pad = _padded_m(m, world_size)
     try:
         if _state is None:
             _state = _FusedWoB(
@@ -317,23 +482,17 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
             )
         if m_pad > _state.m_max or n != _state.n or k != _state.k:
             return None
-        x_in = x if m_pad == m else _state.pad_rows(x, m_pad)
-        # Same quantisation the unfused path does. transpose_scale=True makes
-        # the quantiser write the group scale in physical [K/128, M] order,
-        # which is exactly what the kernel indexes.
-        q_input, x_scale = aiter_per1x128_quant(
-            x_in, quant_dtype=aiter.dtypes.fp8, transpose_scale=True
-        )
-        weight = _fused_weight(layer)
-        if weight is None:
+        prepared = _fused_weight(layer)
+        if prepared is None:
             return None
-        # Flat, explicitly. transpose_scale=True writes the group scale in
-        # K/128-major order but keeps the (M, K/128) shape, so the tensor's shape
-        # does not describe its contents and the op refuses to guess -- see
-        # _flatten_a_scale. Passing the 2-D tensor transposes it and returns an
-        # answer that is wrong by relL2 0.36, which is perplexity 862511 against
-        # the unfused path's 3.26.
-        out = _state.run(q_input, x_scale.reshape(-1), weight, layer.weight_scale_inv)
+        weight, b_scale = prepared
+        x_in = x if m_pad == m else _state.pad_rows(x, m_pad)
+        # The quantiser writes mori's packed scale layout itself, so there is no
+        # conversion pass after it. Zero-padded rows quantise to zero values
+        # (their scale is tiny but finite), and rows are independent in a GEMM,
+        # so the padding contributes nothing to any real row.
+        q_input, x_scale = _quantize_packed(x_in)
+        out = _state.run(q_input, x_scale, weight, b_scale)
         out = out[:m]
     except ValueError as err:
         # A shape or contract rejection is about *this call*, not about the
@@ -380,9 +539,7 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
         # Same inputs, immediately again: if the two disagree the server context
         # is racing the collective; if they agree the op is deterministic here
         # and merely disagrees with the reference.
-        again = _state.run(
-            q_input, x_scale.reshape(-1), weight, layer.weight_scale_inv
-        )[:m].clone()
+        again = _state.run(q_input, x_scale, weight, b_scale)[:m].clone()
         self_rel = ((out.float() - again.float()).norm() / out.float().norm()).item()
         ref, _ = layer(x)
         rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
