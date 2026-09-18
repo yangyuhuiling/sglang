@@ -70,28 +70,47 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-#: Smallest padded M worth fusing. Measured at ``[*, 7168] K=2048`` on 8 ranks
-#: against the aiter GEMM + NCCL pair the model runs today: 1024 -2.6%, 2048
-#: -7.8%, 4096 -12.3%, 8192 -15.7%, 16384 -19.4%. At 1024 a destination gets a
-#: single row band, so there is nothing to overlap and the fused kernel is 1.2%
-#: *slower* than the same pipeline unfused.
-_MIN_FUSED_M = 4096
-#: The fp8 gather used to need a higher floor: with the SDMA transport its two
-#: conversion kernels were a fixed cost against a transfer that shrinks with M,
-#: so it was 2.3% *slower* at M=4096 and only paid from 8192 up. The LSA pull
-#: removed that -- it widens on the way in, so there is no second kernel and no
-#: re-read of the landed fp8 -- and fp8 now wins wherever fusing does at all.
-#: Measured on the fused path at ``[*, 7168] K=2048``, fp8/lsa against bf16:
-#: M=4096 -7.3% (335.8 -> 311.3us), M=8192 -13.8% (593.7 -> 512.0).
+#: Smallest padded M worth fusing on a **bf16** wire.
 #:
-#: Keeping 8192 is not merely conservative, it is a loss: a chunk between the
-#: two floors takes neither wire and falls back to NCCL entirely.
-_MIN_FUSED_M_FP8_GATHER = _MIN_FUSED_M
-#: Padding buys the overlap and costs GEMM rows, so the fill ratio has to clear
-#: the gain at the padded size. 0.88 is break-even at ``_MIN_FUSED_M`` (12%
-#: more rows against a 12.3% gain) and increasingly safe above it. Measured:
-#: M=3616 padded to 4096 is 342.1us against 371.4 for the unfused pair.
-_MIN_PAD_FILL = 0.88
+#: 16384 rather than V4-Pro's 4096, and the honest reading of the measurements
+#: is that this wire is not worth enabling here at all -- 16384 is where it
+#: first clears the noise, not where it starts paying. Against what runs today
+#: (``mxfp8_native_blockscaled_linear`` + NCCL) at TP4 N=5120 K=2048, by m_pad:
+#:
+#:     m_pad  5120   +11.0%      m_pad  9216   +10.9% .. -8.5%
+#:     m_pad  8192   -0.4% .. -9.5%    m_pad 13312   -2.2% .. -2.4%
+#:     m_pad 16384  -12.2%
+#:
+#: The spread within one m_pad is the *baseline* moving, not the fused path:
+#: today's route retunes per M bucket and swings ~20% between them (M=8200
+#: costs 943us, M=8800 costs 1133). The fusion's own contribution does not
+#: clear that, which is the arithmetic in the module docstring -- the GEMM is
+#: 178us against 1414us of communication, so the ceiling is 11-15%.
+_MIN_FUSED_M = 16384
+#: The same for the **fp8** wire, which is a different question and gets a
+#: different answer: it is consistently 15-25% below the bf16 wire, so it does
+#: clear the baseline's bucket noise. Every m_pad >= 8192 measured wins, worst
+#: case -7.4%:
+#:
+#:     m_pad  8192  -16.7% .. -24.4%   m_pad 13312  -18.6% .. -18.7%
+#:     m_pad  9216   -7.4% .. -23.6%   m_pad 16384  -28.8%
+#:
+#: Below that it is not monotonic. m_pad 3072 and 4096 win (-9.8%, -13.0%) but
+#: **m_pad 5120 loses** (+18.7%, +8.8%, -0.5%): the fused cost jumps 510 ->
+#: 600us across that step while the baseline only goes 587 -> 603, because both
+#: are in one dot_scaled bucket and it is not compute-bound there. A single
+#: floor cannot keep 4096 and drop 5120, so this gives up the small win below
+#: rather than take an 18% regression on a band of M a server will actually hit.
+_MIN_FUSED_M_FP8_GATHER = 8192
+#: Padding buys the overlap and costs GEMM rows, so a ragged M has to be full
+#: enough that the gain at the padded size still clears it.
+#:
+#: Note this does not bind at the floors above: the granule is
+#: ``tp_size * 256``, so at m_pad >= 8192 the fill cannot fall below
+#: (8192-1023)/8192 = 0.875 in the first place. It is a guard for a lowered
+#: floor rather than an active rule. The lowest fill measured above the floor,
+#: 0.879 at M=7200, wins -16.7% on the fp8 wire.
+_MIN_PAD_FILL = 0.85
 _state: Optional[_FusedWoB] = None
 _disabled = False
 _warned_layout = False
