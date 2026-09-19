@@ -67,25 +67,26 @@ logger = logging.getLogger(__name__)
 #: measured at -- and this was measured at N=8192 and N=5120, then applied to
 #: layers a quarter that wide.
 #:
-#: Over 93 measured points, 12 shapes from the checkpoint x 7 M values, cold:
+#: Scored over the 77 points this gate actually decides -- 12 shapes from the
+#: checkpoint, M above the GEMV's 32 tokens, and a shape `supports_gemm` accepts
+#: -- by the percentage each threshold gets wrong, losses served plus wins
+#: declined, cold:
 #:
-#:     gate                       served & slower   wins forfeited
-#:     M >= 1280 (what this was)       167%               62%
-#:     grid >= 80 (this)                23%                9%
+#:     gate                  served & slower   forfeited   total
+#:     grid >= 64                   49.2%         0.0%     49.2%
+#:     grid >= 80 (this)            17.7%         0.0%     17.7%
+#:     grid >= 96                    7.9%         2.6%     10.5%
+#:     grid >= 128                   7.9%        26.7%     34.6%
 #:
-#: summing the percentage on each point it gets wrong. The M-only gate's 167%
-#: is not spread thin; it is four narrow-N layers it should never have touched:
+#: **96 is nominally better and 80 is kept anyway.** The 7-point gap between
+#: them is two measurements that sit at *exactly* grid 80 and disagree -- wo_b
+#: TP8 at M=1024 wins 2.6%, wq_a at M=4096 loses 9.0% -- so no threshold on the
+#: grid can separate them, and moving the constant to sit between two points it
+#: cannot distinguish is fitting noise rather than the curve.
 #:
-#:     layer          N      M      grid    mori vs native
-#:     wkv           512   2048      16         +84.1%
-#:     wq_a         1280   2048      40         +25.4%
-#:     wo_a (TP8)   1024   2048      32         +20.1%
-#:     wkv           512   4096      32         +18.2%
-#:     wqkv_a       1792   2048      56          +8.5%
-#:
-#: 80 is where the residual is smallest on both sides; it is a fitted threshold,
-#: not a derived one. What survives it is small and two-sided: at worst +8.0%
-#: (wq_b TP1, M=64) served, and at worst -4.9% (wkv, M=8192) forfeited.
+#: A floor on M alone is a different matter and is wrong by an order of
+#: magnitude. `M >= 1280`, read off wq_b and wo_b, served wkv at M=2048 for
+#: +140% and wq_a for +55%.
 #:
 #: The same quantity, at 140, picks mori's N tile inside the op -- see
 #: `_WIDE_TILE_MIN_GRID` in mori's `gemm.py`. That it turns up twice is the
