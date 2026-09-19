@@ -110,7 +110,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-m", default="512,1024,4096,16384,1000")
     p.add_argument("--gemv-m", default="1,2,7,16,32")
-    p.add_argument("--floor", type=int, default=64)
+    p.add_argument("--floor", type=int, default=0, help="_MIN_GRID override")
     args = p.parse_args()
 
     import sglang.srt.layers.mori_mxfp8_gemm as mori_gemm
@@ -120,7 +120,7 @@ def main():
     )
     from sglang.srt.environ import envs
 
-    mori_gemm._MIN_M = args.floor
+    mori_gemm._MIN_GRID = args.floor
     with envs.SGLANG_OPT_MORI_MXFP8_GEMM.override(True):
         for label, (n, k) in SHAPES.items():
             for m in (int(v) for v in args.gemv_m.split(",")):

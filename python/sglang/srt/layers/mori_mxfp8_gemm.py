@@ -59,37 +59,50 @@ from sglang.srt.layers.mori_mxfp8_common import (
 
 logger = logging.getLogger(__name__)
 
-#: Smallest M worth handing to mori rather than the native route.
+#: Workgroups mori's GEMM grid needs before it is worth using at all.
 #:
-#: Against `mxfp8_native_blockscaled_linear`, TP4, one M per process, **cold**
-#: -- the weight rotated past the LLC, which is what a forward pass does:
+#: **Not a floor on M.** mori's tile is 256 rows by 256 columns, so its grid is
+#: `ceildiv(M, 256) * (N / 256)` and what starves it is the product, not either
+#: factor. A floor on M alone is therefore only ever right for the N it was
+#: measured at -- and this was measured at N=8192 and N=5120, then applied to
+#: layers a quarter that wide.
 #:
-#:     M       wq_b (8192x1280)   wo_b (5120x2048)
-#:      512         +16.6%             +30.0%
-#:     1024          +3.8%              -1.7%
-#:     1280         -12.8%              +1.4%
-#:     1536         -22.8%              -0.5%
-#:     1792         -25.8%             -25.3%
-#:     2048         -25.3%             -19.8%
-#:    16384         -26.8%             -27.3%
+#: Over 93 measured points, 12 shapes from the checkpoint x 7 M values, cold:
 #:
-#: 1280 is where wq_b turns over. wo_b is a wash from 1024 to 1536 (+-1.7%, no
-#: consistent sign) and only wins outright from 1792, so one floor at 1280 takes
-#: wq_b's win and costs wo_b nothing measurable -- which is why this is one
-#: number rather than a per-shape pair.
+#:     gate                       served & slower   wins forfeited
+#:     M >= 1280 (what this was)       167%               62%
+#:     grid >= 80 (this)                23%                9%
 #:
-#: **Both of the numbers that set this before were wrong**, in opposite
-#: directions. The old table read -5.1% / -5.9% at M=1024 and put the floor
-#: there; it was measured one call per CUDA-graph capture, and a single replay
-#: on this box has a 13.4us floor that inflated both sides and compressed the
-#: ratio. Re-measured, M=1024 is +3.8% / -1.7%: not a win. And the 1280-1792
-#: band was *worse* than it had to be, because mori picked its N tile on a bare
-#: `M < 2048` fitted to an M grid that never looked between 1024 and 2048 -- it
-#: now picks on the resulting grid size, which is what the choice was always
-#: about. At wq_b M=1280 that one change is +19.9% -> -12.8%.
-_MIN_M = 1280
+#: summing the percentage on each point it gets wrong. The M-only gate's 167%
+#: is not spread thin; it is four narrow-N layers it should never have touched:
+#:
+#:     layer          N      M      grid    mori vs native
+#:     wkv           512   2048      16         +84.1%
+#:     wq_a         1280   2048      40         +25.4%
+#:     wo_a (TP8)   1024   2048      32         +20.1%
+#:     wkv           512   4096      32         +18.2%
+#:     wqkv_a       1792   2048      56          +8.5%
+#:
+#: 80 is where the residual is smallest on both sides; it is a fitted threshold,
+#: not a derived one. What survives it is small and two-sided: at worst +8.0%
+#: (wq_b TP1, M=64) served, and at worst -4.9% (wkv, M=8192) forfeited.
+#:
+#: The same quantity, at 140, picks mori's N tile inside the op -- see
+#: `_WIDE_TILE_MIN_GRID` in mori's `gemm.py`. That it turns up twice is the
+#: point: both questions are "is this grid big enough", asked of the same grid.
+_MIN_GRID = 80
 
-#: Below `_MIN_M` mori has a second kernel, a skinny GEMM built for decode's M,
+#: The tile this grid is counted in. Must track mori's `MXFP8_BLOCK_M` and
+#: `DEFAULT_BLOCK_N`; both are 256 and neither is a knob a caller turns.
+_TILE = 256
+
+
+
+def _grid_worth_it(m: int, n: int) -> bool:
+    """Whether mori's GEMM grid is big enough on a 256-CU part. See `_MIN_GRID`."""
+    return -(-m // _TILE) * (n // _TILE) >= _MIN_GRID
+
+#: At or below this M mori has a second kernel, a skinny GEMM built for decode,
 #: and it is served on one condition: **the activation must already be fp8**.
 #:
 #: The kernels alone, cold, against `mxfp8_gemv` on the same operands:
@@ -258,11 +271,12 @@ def mori_mxfp8_linear(
     if not mori_mxfp8_available():
         return None
 
-    # The M test first and on x's own shape: below the GEMV's token tile *and*
-    # bf16 covers most decode calls, and anything past this point runs on all of
-    # them.
+    # A bf16 activation on a decode-sized batch is the one case worth rejecting
+    # before anything else is read: neither kernel serves it, and it is most of
+    # the calls this hook ever sees -- 40 layers times several linears, every
+    # step. Everything below runs on prefill batches only, which are few.
     m = x.shape[0] if x.dim() == 2 else x.numel() // x.shape[-1]
-    if m < _MIN_M and (m > _GEMV_MAX_M or input_scale is None):
+    if m <= _GEMV_MAX_M and input_scale is None:
         if _SHAPE_LOG:
             _record_shape(*mxfp8_shape(layer), m, False)
         return None
@@ -277,7 +291,11 @@ def mori_mxfp8_linear(
     try:
         if not mxfp8_ready(layer):
             return None
-        if m < _MIN_M:
+        if m > _GEMV_MAX_M and not _grid_worth_it(m, n):
+            if _SHAPE_LOG:
+                _record_shape(n, k, m, False)
+            return None
+        if m <= _GEMV_MAX_M:
             out = _try_gemv(layer, x_2d, input_scale, m, n, k)
             if _SHAPE_LOG:
                 _record_shape(n, k, m, out is not None)
