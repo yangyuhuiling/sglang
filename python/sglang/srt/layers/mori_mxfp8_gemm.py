@@ -53,23 +53,24 @@ logger = logging.getLogger(__name__)
 
 #: Smallest M worth handing to mori rather than the native route.
 #:
-#: Against `mxfp8_native_blockscaled_linear` at V4.1-Flash's two attention
-#: shapes, TP4, graph-replayed, one M per process, two runs:
+#: Against `mxfp8_native_blockscaled_linear`, TP4, graph-replayed, one M per
+#: process, two runs, with mori picking its N tile by M:
 #:
 #:     M       wq_b (8192x1280)   wo_b (5120x2048)
-#:       64         +45.8%             +66.5%
-#:      256         +36.6%             +36.5%
-#:      512          +2.0%             +22.1%
-#:     1024          -4.9%              -1.2%
-#:     2048         -24.0%             -20.4%
-#:    16384         -34.1%             -28.9%
+#:      128         +31.8%             +36.5%
+#:      512          +0.5%             +13.0%
+#:     1024          -5.1%              -5.9%
+#:     2048         -23.8%             -20.6%
+#:    16384         -34.5%             -29.9%
 #:
-#: mori's time is almost flat from M=64 to 512 (29-39us on both shapes) because
-#: the 256x256 tile is mostly idle there, while the native route drops to a
-#: GEMV-shaped kernel that suits it. 2048 rather than 1024: at 1024 both shapes
-#: are inside run-to-run noise -- 1.6us and 0.5us of absolute difference -- so
-#: there is nothing there to collect, and from 2048 both win by at least 20%.
-_MIN_M = 2048
+#: 1024 rather than 2048, which is where this sat before mori grew a narrow-N
+#: tile for small M. Below 1024 mori is still launch-starved even on the narrow
+#: tile -- at M=128 its grid is 64 workgroups on a 256-CU part -- while the
+#: native route drops to a GEMV shape built for exactly that.
+#:
+#: Worth the move: a GSM8K-shaped workload prefills at M around 1200-1500, which
+#: the old floor excluded entirely.
+_MIN_M = 1024
 
 _ops: dict[tuple[int, int], object] = {}
 _disabled = False
