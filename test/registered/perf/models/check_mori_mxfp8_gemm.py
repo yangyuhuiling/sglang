@@ -68,9 +68,48 @@ def build(n, k, seed=1234):
     return _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0, weight_bf16)
 
 
+def check_gemv(mori_gemm, label, n, k, m):
+    """The skinny-GEMM leg, which is a different kernel and a different contract.
+
+    Only the fp8-input form is checked because only it is served -- a bf16
+    activation is declined, since quantising it costs more than the kernel
+    saves. The reference is `mxfp8_gemv` on the same fp8 bytes: same
+    instruction, same operands, so **bit-identical is the expected result** and
+    anything else means the layouts disagree.
+    """
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
+    from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import mxfp8_gemv
+
+    layer = build(n, k)
+    xq, xs = mxfp8_e4m3_quantize(
+        (torch.randn(m, k, device="cuda") / 8).to(torch.bfloat16)
+    )
+    got = mori_gemm.mori_mxfp8_linear(layer, xq, None, xs, True)
+    if got is None:
+        return {"shape": label, "m": m, "leg": "gemv", "served": False}
+    ref = mxfp8_gemv(
+        xq, layer.weight.view(torch.uint8), layer.weight_scale_mx_e8m0, x_scale=xs
+    )
+    rel = (
+        torch.linalg.vector_norm(got.float() - ref.float())
+        / torch.linalg.vector_norm(ref.float())
+    ).item()
+    return {
+        "shape": label,
+        "n": n,
+        "k": k,
+        "m": m,
+        "leg": "gemv",
+        "served": True,
+        "bit_identical": bool(torch.equal(got, ref)),
+        "rel_l2": rel,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-m", default="512,1024,4096,16384,1000")
+    p.add_argument("--gemv-m", default="1,2,7,16,32")
     p.add_argument("--floor", type=int, default=64)
     args = p.parse_args()
 
@@ -83,6 +122,12 @@ def main():
 
     mori_gemm._MIN_M = args.floor
     with envs.SGLANG_OPT_MORI_MXFP8_GEMM.override(True):
+        for label, (n, k) in SHAPES.items():
+            for m in (int(v) for v in args.gemv_m.split(",")):
+                print(
+                    "RESULT_JSON " + json.dumps(check_gemv(mori_gemm, label, n, k, m)),
+                    flush=True,
+                )
         for label, (n, k) in SHAPES.items():
             layer = build(n, k)
             for m in (int(v) for v in args.m.split(",")):

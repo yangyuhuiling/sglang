@@ -31,8 +31,16 @@ Both operand forms the hook can hand over are served: a bf16 activation, and
 the fp8-plus-row-major-scale one a fused producer emits. The second needs the
 scale converting, which is not free, and is still a win -- see `_a_operands`.
 
+**Two mori kernels come through here, not one.** Above `_MIN_M` it is the GEMM
+above; below it, and only for an already-fp8 activation, it is a skinny GEMM
+built for decode's token counts. They are different kernels with different
+operand layouts and different reasons for being faster, and the split between
+them is `_GEMV_MAX_M`, which documents why it is the operand form rather than M
+that decides.
+
 Returning None means "use the normal path" and is not a failure: an unsupported
-shape or an M below the floor both land there.
+shape, a bf16 activation at decode, or an M in the band neither kernel wins all
+land there.
 """
 
 from __future__ import annotations
@@ -53,26 +61,62 @@ logger = logging.getLogger(__name__)
 
 #: Smallest M worth handing to mori rather than the native route.
 #:
-#: Against `mxfp8_native_blockscaled_linear`, TP4, graph-replayed, one M per
-#: process, two runs, with mori picking its N tile by M:
+#: Against `mxfp8_native_blockscaled_linear`, TP4, one M per process, **cold**
+#: -- the weight rotated past the LLC, which is what a forward pass does:
 #:
 #:     M       wq_b (8192x1280)   wo_b (5120x2048)
-#:      128         +31.8%             +36.5%
-#:      512          +0.5%             +13.0%
-#:     1024          -5.1%              -5.9%
-#:     2048         -23.8%             -20.6%
-#:    16384         -34.5%             -29.9%
+#:      512         +16.6%             +30.0%
+#:     1024          +3.8%              -1.7%
+#:     1280         -12.8%              +1.4%
+#:     1536         -22.8%              -0.5%
+#:     1792         -25.8%             -25.3%
+#:     2048         -25.3%             -19.8%
+#:    16384         -26.8%             -27.3%
 #:
-#: 1024 rather than 2048, which is where this sat before mori grew a narrow-N
-#: tile for small M. Below 1024 mori is still launch-starved even on the narrow
-#: tile -- at M=128 its grid is 64 workgroups on a 256-CU part -- while the
-#: native route drops to a GEMV shape built for exactly that.
+#: 1280 is where wq_b turns over. wo_b is a wash from 1024 to 1536 (+-1.7%, no
+#: consistent sign) and only wins outright from 1792, so one floor at 1280 takes
+#: wq_b's win and costs wo_b nothing measurable -- which is why this is one
+#: number rather than a per-shape pair.
 #:
-#: Worth the move: a GSM8K-shaped workload prefills at M around 1200-1500, which
-#: the old floor excluded entirely.
-_MIN_M = 1024
+#: **Both of the numbers that set this before were wrong**, in opposite
+#: directions. The old table read -5.1% / -5.9% at M=1024 and put the floor
+#: there; it was measured one call per CUDA-graph capture, and a single replay
+#: on this box has a 13.4us floor that inflated both sides and compressed the
+#: ratio. Re-measured, M=1024 is +3.8% / -1.7%: not a win. And the 1280-1792
+#: band was *worse* than it had to be, because mori picked its N tile on a bare
+#: `M < 2048` fitted to an M grid that never looked between 1024 and 2048 -- it
+#: now picks on the resulting grid size, which is what the choice was always
+#: about. At wq_b M=1280 that one change is +19.9% -> -12.8%.
+_MIN_M = 1280
+
+#: Below `_MIN_M` mori has a second kernel, a skinny GEMM built for decode's M,
+#: and it is served on one condition: **the activation must already be fp8**.
+#:
+#: The kernels alone, cold, against `mxfp8_gemv` on the same operands:
+#:
+#:     M     wq_b 8192x1280   wo_b 5120x2048
+#:      1        -7.1%            -7.7%
+#:      8        -4.4%            -8.4%
+#:     32        +1.4%           -10.7%
+#:
+#: But sglang's GEMV *quantises a bf16 activation inside the kernel*, and mori's
+#: takes fp8, so a bf16 caller pays a separate `mxfp8_e4m3_quantize` launch.
+#: That pass is 2.0us at these sizes -- almost all of it launch, since it moves
+#: at most 128KB -- which is more than the whole kernel win:
+#:
+#:     M     bf16 in, whole pipeline    wq_b      wo_b
+#:      1                               +21.4%    +21.7%
+#:      8                               +33.8%    +26.4%
+#:     32                               +19.7%     +5.0%
+#:
+#: So the gate is the operand form, not M. When the activation arrives fp8 with
+#: its row-major `[M, K/32]` ue8m0 scale -- what a fused producer emits -- mori
+#: needs *no* conversion at all, unlike the GEMM path above, which has to run
+#: `preshuffle_a_scale` on it.
+_GEMV_MAX_M = 32
 
 _ops: dict[tuple[int, int], object] = {}
+_gemv_ops: dict[tuple[int, int], object] = {}
 _disabled = False
 _warned_reject = False
 
@@ -118,6 +162,44 @@ def _op_for(n: int, k: int):
         return False
     _ops[(n, k)] = Mxfp8GemmOp(n=n, k=k)
     return _ops[(n, k)]
+
+
+def _gemv_op_for(n: int, k: int):
+    """The skinny-GEMM op for this shape, or False if mori cannot express it."""
+    hit = _gemv_ops.get((n, k))
+    if hit is not None:
+        return hit
+    from mori.ops.gemm_ar import Mxfp8GemvOp, supports_gemv
+
+    if not supports_gemv(n, k):
+        _gemv_ops[(n, k)] = False
+        return False
+    _gemv_ops[(n, k)] = Mxfp8GemvOp(n=n, k=k)
+    return _gemv_ops[(n, k)]
+
+
+def _try_gemv(layer, x_2d, input_scale, m, n, k):
+    """The skinny GEMM, or None to fall through. See `_GEMV_MAX_M`.
+
+    `input_scale` being None means a bf16 activation, which this declines --
+    not because the kernel cannot take one, but because quantising it costs more
+    than the kernel saves.
+    """
+    if m > _GEMV_MAX_M or input_scale is None:
+        return None
+    op = _gemv_op_for(n, k)
+    if op is False:
+        return None
+    weight, _ = mori_weight(layer)
+    # The GEMV takes both scales exactly as the checkpoint stores them: the
+    # weight's [N/32, K/32] and the activation's row-major [M, K/32]. No
+    # conversion, which is the whole reason it is worth serving here.
+    return op(
+        x_2d,
+        weight,
+        input_scale.view(torch.uint8).contiguous(),
+        layer.weight_scale_mx_e8m0.data.contiguous().view(torch.uint8),
+    )
 
 
 def _a_operands(op, x, input_scale, m):
@@ -176,10 +258,11 @@ def mori_mxfp8_linear(
     if not mori_mxfp8_available():
         return None
 
-    # The M test first and on x's own shape: it rejects every decode call, and
-    # anything above it here runs on all of them.
+    # The M test first and on x's own shape: below the GEMV's token tile *and*
+    # bf16 covers most decode calls, and anything past this point runs on all of
+    # them.
     m = x.shape[0] if x.dim() == 2 else x.numel() // x.shape[-1]
-    if m < _MIN_M:
+    if m < _MIN_M and (m > _GEMV_MAX_M or input_scale is None):
         if _SHAPE_LOG:
             _record_shape(*mxfp8_shape(layer), m, False)
         return None
@@ -194,6 +277,15 @@ def mori_mxfp8_linear(
     try:
         if not mxfp8_ready(layer):
             return None
+        if m < _MIN_M:
+            out = _try_gemv(layer, x_2d, input_scale, m, n, k)
+            if _SHAPE_LOG:
+                _record_shape(n, k, m, out is not None)
+            if out is None:
+                return None
+            if bias is not None:
+                out = out + bias
+            return out.view(*x.shape[:-1], n)
         op = _op_for(n, k)
         if op is False:
             if _SHAPE_LOG:

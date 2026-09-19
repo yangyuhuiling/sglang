@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
+import os
+import sys
 
 import torch
 
@@ -55,35 +56,22 @@ def build(n, k, seed=1234):
     return _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0, weight_bf16)
 
 
-def median_us(fn, warmup=10, iters=51):
-    """Median over a CUDA-graph replay.
+def _timing():
+    """mori's shared timer, from its benchmark tree.
 
-    Graph-captured rather than eager, because an eager loop measures per-launch
-    host work the server does not pay -- prefill replays a graph. Measuring it
-    eagerly is how an earlier round of this work concluded a path was not worth
-    enabling when it was.
+    Imported rather than reimplemented: it carries two corrections that this
+    file got wrong for a whole round of thresholds -- a single-call graph
+    capture has a 13.4us floor on this box, and a repeated call reads the
+    weight out of LLC at 1.7x the bandwidth a forward pass gets. Both are
+    invisible at M=16384 and dominate at M=64.
     """
-    fn()
-    torch.cuda.synchronize()
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(warmup):
-            fn()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        fn()
-    ts = []
-    for _ in range(iters):
-        s, e = torch.cuda.Event(True), torch.cuda.Event(True)
-        s.record()
-        g.replay()
-        e.record()
-        torch.cuda.synchronize()
-        ts.append(s.elapsed_time(e) * 1000.0)
-    return statistics.median(ts)
+    sys.path.insert(0, os.environ.get("MORI_BENCH_DIR", _DEFAULT_MORI_BENCH))
+    import timing
+
+    return timing
+
+
+_DEFAULT_MORI_BENCH = "/workspace/dsv41/mori/benchmark/cco/flydsl/gemm_ar"
 
 
 def main():
@@ -91,9 +79,11 @@ def main():
     p.add_argument("--shape", choices=sorted(SHAPES), required=True)
     p.add_argument("-m", type=int, required=True)
     p.add_argument("--floor", type=int, default=64)
+    p.add_argument("--reps", type=int, default=32)
     args = p.parse_args()
 
     n, k = SHAPES[args.shape]
+    vram_before = _timing().vram_used()
     import sglang.srt.layers.mori_mxfp8_gemm as mori_gemm
     from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
         mxfp8_native_blockscaled_linear,
@@ -114,14 +104,29 @@ def main():
             weight_bf16=layer.weight_bf16,
         )
 
+    timing = _timing()
+
     with envs.SGLANG_OPT_MORI_MXFP8_GEMM.override(True):
 
-        def mori():
+        def mori(_picked=None):
             return mori_gemm.mori_mxfp8_linear(layer, x, None, None, False)
 
         served = mori() is not None
-        t_base = median_us(base)
-        t_mori = median_us(mori) if served else None
+        t_base = timing.cold_hot_us(lambda _p: base(), [layer.weight], reps=args.reps)
+        t_mori = None
+        if served:
+            # mori reads its *own* copy of the weight, converted once and cached
+            # on the layer, so rotating `layer.weight` would leave the mori
+            # column hot while the baseline went cold. Rotate the converted one
+            # and rebind the cache each call.
+            mori_w, mori_s = mori_gemm.mori_weight(layer)
+
+            def mori_rotated(picked):
+                layer._mori_b = (picked[0], mori_s)
+                return mori()
+
+            t_mori = timing.cold_hot_us(mori_rotated, [mori_w], reps=args.reps)
+            layer._mori_b = (mori_w, mori_s)
 
     print(
         "RESULT_JSON "
@@ -135,8 +140,10 @@ def main():
                 "ref_route": native_route_plan(
                     m, n, k, layer.weight_bf16 is not None, False
                 ),
-                "base_us": t_base,
-                "mori_us": t_mori,
+                "base": t_base,
+                "mori": t_mori,
+                "vram_before": vram_before,
+                "vram_after": timing.vram_used(),
             }
         ),
         flush=True,
