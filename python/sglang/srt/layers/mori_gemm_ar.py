@@ -70,12 +70,15 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
 from sglang.srt.environ import envs
+from sglang.srt.layers.mori_mxfp8_common import (
+    mori_weight,
+    mxfp8_ready,
+    mxfp8_shape,
+    quantize_packed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,7 @@ _MIN_FUSED_M_FP8_GATHER = 2048
 #: below every fill measured -- the lowest, 0.820 at M=4200, still wins -2.3%
 #: on the fp8 wire -- and guards the range below that, which is not measured.
 _MIN_PAD_FILL = 0.80
-_state: Optional[_FusedWoB] = None
+_state: _FusedWoB | None = None
 _disabled = False
 _warned_layout = False
 _warned_reject = False
@@ -157,87 +160,12 @@ def _record_shape(m, eligible, world_size):
 #: -- so a destination's row band is 256 rows here, not blockscale's 128, and M
 #: pads to a multiple of ``tp_size * 256``.
 _BLOCK_M = 256
-#: The ue8m0 group along K. Also the rows one quantiser program owns, which is
-#: what lets it write mori's packed scale layout without extra traffic.
-_QUANT_BLOCK_M = 64
 
 
 def _padded_m(m: int, world_size: int) -> int:
     from mori.ops.gemm_ar import padded_m
 
     return padded_m(m, world_size, _BLOCK_M)
-
-
-@triton.jit
-def _mxfp8_quant_packed_kernel(
-    x_ptr,
-    xq_ptr,
-    s_ptr,
-    M,
-    K,
-    sxm,
-    sxk,
-    sqm,
-    sqk,
-    BLOCK_M: tl.constexpr,
-):
-    """sglang's ``_mxfp8_quant_kernel`` writing mori's scale layout directly.
-
-    A variant rather than a stride argument on the original, because the layout
-    is not expressible as strides: mori wants element ``(m, kb)`` at
-    ``kb*M + (m//64)*64 + (m%16)*4 + (m%64)//16``, which permutes *within* each
-    64-row group so a lane's four M tiles land in one dword.
-
-    That permutation is free here. The destination stays inside the 64 bytes
-    this program already owns, so the store is the same cache line and only its
-    order changes -- measured bit-identical to quantising and converting
-    afterwards, and slightly faster than the stock kernel, since transposing
-    also turns a strided store into a coalesced one.
-    """
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = pid_b * 32 + tl.arange(0, 32)
-    m_mask = offs_m < M
-    x = tl.load(
-        x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk,
-        mask=m_mask[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30)
-    sb = tl.ceil(tl.log2(amax / 448.0)) + 127.0
-    sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
-    descale = tl.exp2(sb - 127.0)
-    xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
-    tl.store(
-        xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
-        xq,
-        mask=m_mask[:, None],
-    )
-    dst = pid_b * M + (offs_m // 64) * 64 + (offs_m % 16) * 4 + (offs_m % 64) // 16
-    tl.store(s_ptr + dst, sb.to(tl.uint8), mask=m_mask)
-
-
-def _quantize_packed(x: torch.Tensor):
-    """bf16 ``[M, K]`` -> (fp8 e4m3 values, mori's packed ue8m0 A scale)."""
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import MXFP8_VALUE_DTYPE
-
-    m, k = x.shape
-    xq = torch.empty((m, k), dtype=MXFP8_VALUE_DTYPE, device=x.device)
-    scale = torch.empty((k // 32) * m, dtype=torch.uint8, device=x.device)
-    _mxfp8_quant_packed_kernel[(triton.cdiv(m, _QUANT_BLOCK_M), k // 32)](
-        x,
-        xq,
-        scale,
-        m,
-        k,
-        x.stride(0),
-        x.stride(1),
-        xq.stride(0),
-        xq.stride(1),
-        BLOCK_M=_QUANT_BLOCK_M,
-    )
-    return xq, scale.view(torch.int32)
 
 
 _logged_config = False
@@ -251,53 +179,15 @@ def _shuffled_once():
     return False
 
 
-def _fused_shape(layer):
-    """``wo_b``'s logical (N, K).
-
-    Not ``layer.weight.shape``: ``prepare_mxfp8_native_weight`` rebinds the
-    weight to its shuffled form, ``[N/16, K/128, 2048]``, so that first axis is
-    N/16 rather than N. Reading it as N silently disqualifies every layer --
-    5120 becomes 320, ``supports`` says no because 320 is not a multiple of
-    BLOCK_N, and the path falls back without a word. The ue8m0 scale keeps the
-    logical shape, ``[N/32, K/32]``, so take it from there.
-    """
-    sn, sk = layer.weight_scale_mx_e8m0.shape
-    return sn * 32, sk * 32
-
-
 def _fused_weight(layer):
     """The op's B operand and B scale, or None if this layer cannot be fused.
 
-    V4.1-Flash quantises 32-wide ue8m0, and sglang's own native mxfp8 route
-    already prepares almost exactly what mori wants -- ``mxfp8_native_ready``
-    means ``prepare_mxfp8_native_weight`` ran and left the shuffled fp8 bytes on
-    ``layer.weight`` and the ``[N/32, K/32]`` exponent bytes on
-    ``layer.weight_scale_mx_e8m0``. Handing over the unprepared weight does not
-    fail, it returns an uncorrelated result, so this checks rather than assumes.
-
-    Two conversions, both once per layer and cached on it:
-
-    * **The weight.** ``shuffle_mxfp8_weight`` and mori's ``preshuffle_b`` give
-      each lane the same K range and differ only in how the two 64-wide K
-      sub-blocks sit: sglang interleaves them inside a lane's 32 bytes, mori
-      keeps them as two 16-byte blocks. So the permutation below is exact --
-      verified byte-for-byte at [5120, 2048].
-    * **The B scale.** mori indexes it K-block major as int32, and the exponent
-      bytes are already at the 32x32 granularity it wants (not the per-row
-      ``[N, K/32]`` that ``tl.dot_scaled`` takes), so it is a transpose and a
-      widen.
-
-    Cached on the layer rather than recomputed: the permutation is a full copy
-    of the weight, which at 61 layers would be pointless per-call work.
+    The conversion itself is shared with the standalone GEMM path; what is local
+    here is the decision to decline, and warning once when the reason is that
+    sglang never prepared the layer.
     """
     global _warned_layout
-    cached = getattr(layer, "_mori_b", None)
-    if cached is not None:
-        return cached
-
-    if not getattr(layer, "mxfp8_native_ready", False) or not hasattr(
-        layer, "weight_scale_mx_e8m0"
-    ):
+    if not mxfp8_ready(layer):
         if not _warned_layout:
             _warned_layout = True
             logger.warning(
@@ -306,27 +196,7 @@ def _fused_weight(layer):
                 tuple(layer.weight.shape),
             )
         return None
-
-    n, k = _fused_shape(layer)
-    w = layer.weight.data.contiguous().view(torch.uint8)
-    # [N/16, K/128, 64 lanes, 2 sub-blocks, 16B] -> the two sub-blocks split out
-    b = (
-        w.reshape(n // 16, k // 128, 64, 2, 16)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .reshape(n, k)
-        .view(layer.weight.dtype)
-    )
-    b_scale = (
-        layer.weight_scale_mx_e8m0.data.contiguous()
-        .view(torch.uint8)
-        .t()
-        .contiguous()
-        .to(torch.int32)
-        .reshape(-1)
-    )
-    layer._mori_b = (b, b_scale)
-    return layer._mori_b
+    return mori_weight(layer)
 
 
 class _FusedWoB:
@@ -462,7 +332,7 @@ def fused_wo_b_available() -> bool:
     return not _disabled and envs.SGLANG_OPT_FUSED_WO_B_AR.get()
 
 
-def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
+def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
     """wo_b's `GEMM + all-reduce`, fused. ``None`` means "use the normal path".
 
     ``x`` is the bf16 activation this rank holds, ``[M, K]``. The result is the
@@ -489,7 +359,7 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
     m, k = x.shape
     if not hasattr(layer, "weight_scale_mx_e8m0"):
         return None
-    n, w_k = _fused_shape(layer)
+    n, w_k = mxfp8_shape(layer)
     if w_k != k:
         return None
     world_size = get_tp_group().world_size
@@ -518,7 +388,7 @@ def fused_wo_b(layer, x: torch.Tensor) -> Optional[torch.Tensor]:
         # conversion pass after it. Zero-padded rows quantise to zero values
         # (their scale is tiny but finite), and rows are independent in a GEMM,
         # so the padding contributes nothing to any real row.
-        q_input, x_scale = _quantize_packed(x_in)
+        q_input, x_scale = quantize_packed(x_in)
         out = _state.run(q_input, x_scale, weight, b_scale)
         out = out[:m]
     except ValueError as err:

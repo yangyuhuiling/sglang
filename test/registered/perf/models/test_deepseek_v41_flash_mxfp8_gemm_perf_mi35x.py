@@ -1,21 +1,24 @@
-"""MI35x benchmark for DeepSeek-V4.1-Flash with the fused wo_b GEMM+AllReduce.
+"""MI35x benchmark for DeepSeek-V4.1-Flash with mori's mxfp8 GEMM, unfused.
 
-Same three-wire comparison as the V4-Pro suite, on the model the fused path was
-retargeted to. What differs is not the harness but what the numbers are expected
-to say, and setting that expectation is half the point of the file:
+A separate optimisation from the fused wo_b, measured separately because the
+two have different reach and their gains do not add. This is the same multiply
+with nothing fused onto it, so it reaches the layers fusing structurally
+cannot:
 
-    base    unfused, today's mxfp8_native_blockscaled_linear + NCCL
-    fused   fused, bf16 wire
-    fp8     fused, fp8 all-gather leg over the LSA pull
+    wq_b   N=8192 K=1280   ColumnParallel -- no all-reduce to fuse with at all
+    wo_b   N=5120 K=2048   RowParallel -- fused where that pays, this below it
 
-At the layer, on an idle box, against what the model runs today: the bf16 wire
-pays from m_pad 8192 (-12.2% to -19.4%) and the fp8 wire from m_pad 2048, worth
--8.8% to -35.7%. The floors in ``mori_gemm_ar.py`` encode that.
+    base        today's mxfp8_native_blockscaled_linear
+    mori-gemm   the same linear through mori
 
-An earlier revision of this file said the bf16 wire did not clear the noise and
-was not worth enabling. That was a property of the measurement, not the wire:
-the fused path was paying 181.6us per call in FlyDSL's per-dispatch bookkeeping
-and was host-bound. mori's ``_PinnedLaunch`` removed it.
+**The fused path is off in every variant here.** With both on, wo_b's calls
+reach fusing first and this would only catch its leftovers, which measures the
+pair rather than this one.
+
+At the layer, graph-replayed on an idle box, it is -20% to -34% from M=2048 up
+and a loss below it: mori's 256x256 tile is mostly idle at small M, where the
+native route drops to a GEMV shape that suits it. ``_MIN_M`` encodes that, so
+the decode column below is expected to show nothing at all.
 
 Both halves are needed. A fused all-reduce that does not move bytes is *faster*
 than one that does, so a perf table cannot on its own tell an optimisation from
@@ -24,14 +27,13 @@ a broken transport; GSM8K is what makes the perf number mean something. mori's
 file skips a fused variant when it trips rather than publishing numbers from a
 stack that is not doing the work.
 
-One check the V4-Pro suite does not make, and it matters more here because the
-floors are higher: **that the fused path ran at all during the accuracy gate.**
-GSM8K's prompts are short, so whether a prefill batch ever reaches m_pad 8192
-depends on how the scheduler packs them. If it never does, the accuracy gate
-passed on the base path wearing a fused label. ``_SHAPE_LOG`` exists for exactly
-this, and ``_fused_engaged`` reads it.
+One check worth keeping from the fused suite, and it matters at least as much
+here: **that the path ran at all during the accuracy gate.** A path that
+declined every call looks exactly like one that ran and lost -- the model stays
+correct, the profile stays plausible, and the table reports the baseline under
+mori's name. ``_mori_engaged`` reads the shape histogram and fails instead.
 
-Registry: nightly-perf-4-gpu-mi35x-deepseek-v41-flash-wo-b-fusion suite
+Registry: nightly-perf-4-gpu-mi35x-deepseek-v41-flash-mxfp8-gemm suite
 """
 
 import json
@@ -40,7 +42,6 @@ import re
 import subprocess
 import unittest
 from types import SimpleNamespace
-from typing import Dict, List, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -101,18 +102,15 @@ COMMON_ENV_VARS = {
     "MORI_SOCKET_IFNAME": "lo",
 }
 
-_FUSED_ENV = {
-    "SGLANG_OPT_FUSED_WO_B_AR": "1",
-    # So _fused_engaged can tell "fused and was not worth it" from "never fused".
-    "SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG": "1",
-}
-
 VARIANTS = [
     {"name": "base", "env": {}},
-    {"name": "fused", "env": dict(_FUSED_ENV)},
     {
-        "name": "fp8",
-        "env": {**_FUSED_ENV, "SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER": "1"},
+        "name": "mori-gemm",
+        "env": {
+            "SGLANG_OPT_MORI_MXFP8_GEMM": "1",
+            # So _mori_engaged can tell "ran and lost" from "never ran".
+            "SGLANG_OPT_MORI_MXFP8_GEMM_SHAPE_LOG": "1",
+        },
     },
 ]
 
@@ -150,13 +148,13 @@ SERVER_ARGS = [
 #: failure and falls back. That is the right behaviour and it is also *silent*:
 #: the model is correct, GSM8K passes, and the perf table reports a fused
 #: variant that never fused. Only the server's own log says so.
-_FALLBACK_MARKER = "mori fused wo_b failed and is disabled"
-#: The periodic histogram, e.g. "wo_b shapes: M=16384/pad16384+x120 M=512/pad1024-x9".
-#: A "+" is an eligible call, a "-" a declined one.
-_SHAPE_LINE = re.compile(r"wo_b shapes: (.*)")
+_FALLBACK_MARKER = "mori mxfp8 GEMM failed and is disabled"
+#: The periodic histogram, e.g. "mori mxfp8 shapes: 8192x1280/M=16384+x40 ...".
+#: A "+" is a served call, a "-" a declined one.
+_SHAPE_LINE = re.compile(r"mori mxfp8 shapes: (.*)")
 
 
-def _fallback_reason(server_log: str) -> Optional[str]:
+def _fallback_reason(server_log: str) -> str | None:
     """The line where the server gave up on the fused path, if it did."""
     try:
         with open(server_log, errors="ignore") as f:
@@ -168,7 +166,7 @@ def _fallback_reason(server_log: str) -> Optional[str]:
     return None
 
 
-def _fused_engaged(server_log: str) -> Optional[str]:
+def _mori_engaged(server_log: str) -> str | None:
     """The eligible shapes the layer actually saw, or None if it saw none.
 
     Distinguishes the two ways a fused variant can produce base-like numbers:
@@ -181,23 +179,21 @@ def _fused_engaged(server_log: str) -> Optional[str]:
             for line in f:
                 m = _SHAPE_LINE.search(line)
                 if m:
-                    seen.extend(
-                        tok for tok in m.group(1).split() if "+" in tok.split("pad")[-1]
-                    )
+                    seen.extend(tok for tok in m.group(1).split() if "+" in tok)
     except OSError:
         return None
     return " ".join(sorted(set(seen))) if seen else None
 
 
-class TestDeepseekV41FlashWoBFusionPerfMI35x(CustomTestCase):
+class TestDeepseekV41FlashMxfp8GemmPerfMI35x(CustomTestCase):
     """One server per wire, GSM8K then bench_one_batch_server on each."""
 
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.report: List[str] = []
-        cls.accuracy: Dict[str, float] = {}
+        cls.report: list[str] = []
+        cls.accuracy: dict[str, float] = {}
 
     @classmethod
     def tearDownClass(cls):
@@ -208,7 +204,7 @@ class TestDeepseekV41FlashWoBFusionPerfMI35x(CustomTestCase):
         env = os.environ.copy()
         env.update(COMMON_ENV_VARS)
         env.update(variant["env"])
-        log_path = f"/tmp/dsv41_flash_wo_b_fusion_{variant['name']}.serverlog"
+        log_path = f"/tmp/dsv41_flash_mxfp8_gemm_{variant['name']}.serverlog"
         log = open(log_path, "w")
         process = popen_launch_server(
             self.model,
@@ -243,7 +239,7 @@ class TestDeepseekV41FlashWoBFusionPerfMI35x(CustomTestCase):
         )
 
     def _bench(self, variant_name):
-        json_output = f"/tmp/dsv41_flash_wo_b_fusion_{variant_name}.json"
+        json_output = f"/tmp/dsv41_flash_mxfp8_gemm_{variant_name}.json"
         if os.path.exists(json_output):
             os.remove(json_output)
         cmd = [
@@ -319,7 +315,7 @@ class TestDeepseekV41FlashWoBFusionPerfMI35x(CustomTestCase):
                     )
             self._bench(variant["name"])
             if variant["env"]:
-                engaged = _fused_engaged(log_path)
+                engaged = _mori_engaged(log_path)
                 self.assertIsNotNone(
                     engaged,
                     f"{variant['name']}: no wo_b call was ever eligible, so both "
@@ -327,19 +323,16 @@ class TestDeepseekV41FlashWoBFusionPerfMI35x(CustomTestCase):
                     f"path. Either the floors are above every M this workload "
                     f"produces, or --chunked-prefill-size is below them.",
                 )
-                print(f"[{variant['name']}] fused shapes: {engaged}")
-                self.report.append(f"fused shapes: `{engaged}`")
+                print(f"[{variant['name']}] mori shapes: {engaged}")
+                self.report.append(f"mori shapes: `{engaged}`")
         finally:
             kill_process_tree(process.pid)
 
     def test_a_base(self):
         self._run_variant(VARIANTS[0])
 
-    def test_b_fused(self):
+    def test_b_mori_gemm(self):
         self._run_variant(VARIANTS[1])
-
-    def test_c_fp8(self):
-        self._run_variant(VARIANTS[2])
 
 
 if __name__ == "__main__":
