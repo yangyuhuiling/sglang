@@ -114,8 +114,9 @@ def _grid_worth_it(m: int, n: int) -> bool:
 #:
 #: But sglang's GEMV *quantises a bf16 activation inside the kernel*, and mori's
 #: takes fp8, so a bf16 caller pays a separate `mxfp8_e4m3_quantize` launch.
-#: That pass is 2.0us at these sizes -- almost all of it launch, since it moves
-#: at most 128KB -- which is more than the whole kernel win:
+#: That pass is 2.0-2.3us on every shape -- near enough all of it launch, since
+#: it moves at most 128KB -- and on `wq_b` and `wo_b` that is more than the whole
+#: kernel win:
 #:
 #:     M     bf16 in, whole pipeline    wq_b      wo_b
 #:      1                               +21.4%    +21.7%
@@ -126,6 +127,17 @@ def _grid_worth_it(m: int, n: int) -> bool:
 #: its row-major `[M, K/32]` ue8m0 scale -- what a fused producer emits -- mori
 #: needs *no* conversion at all, unlike the GEMM path above, which has to run
 #: `preshuffle_a_scale` on it.
+#:
+#: **This is not a general fact about bf16, and it was stated as one here.**
+#: sglang's fusion quantises the same activation once per workgroup, so its cost
+#: grows with N and K where mori's separate pass does not. Measured across all
+#: twelve of the checkpoint's shapes, mori wins the bf16 pipeline wherever
+#: sglang's in-kernel quantise exceeds one launch -- `wkv` by 6%, `wq_a` by 5%,
+#: `wq_b` at TP1 by 16%. It stays declined anyway: the layers this hook is
+#: enabled on are `wq_b` and `wo_b`, which are the two worst rows of that table,
+#: and a gate would have to predict sglang's redundant cost from the shape across
+#: a boundary thinner than run-to-run noise. See mori's README, "Why a bf16
+#: activation is not simply worse".
 _GEMV_MAX_M = 32
 
 _ops: dict[tuple[int, int], object] = {}
