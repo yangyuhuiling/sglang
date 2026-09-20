@@ -31,6 +31,21 @@ depends on how the scheduler packs them. If it never does, the accuracy gate
 passed on the base path wearing a fused label. ``_SHAPE_LOG`` exists for exactly
 this, and ``_fused_engaged`` reads it.
 
+The ``both`` variant runs the fused path and the standalone mxfp8 GEMM together.
+They are not additive: the model calls ``fused_wo_b`` first and the linear only
+sees what it declines, so at ``wo_b`` they divide the layer by M, and what the
+GEMM adds on top is the column-parallel layers fusing cannot reach. Measured
++7.4% to +7.7% against +6.0% for the fp8 wire alone.
+
+**One ``both`` server out of nine has hit an illegal memory access** -- 13
+minutes into GSM8K at ~250 concurrent requests, four ranks at once,
+``hipErrorIllegalAddress``. It has not reproduced: the same variant re-run
+completed cleanly. It is *not* established that the combination caused it. If
+this variant fails again, that is the second sample, and the thing to do then is
+re-run it under ``AMD_SERIALIZE_KERNEL=3`` -- which is only worth spending on a
+repro that reproduces. What has already been ruled out is recorded in mori's
+``python/mori/ops/gemm_ar/README.md``, under "End to end, in SGLang".
+
 Registry: nightly-perf-4-gpu-mi35x-deepseek-v41-flash-wo-b-fusion suite
 """
 
@@ -113,6 +128,20 @@ VARIANTS = [
     {
         "name": "fp8",
         "env": {**_FUSED_ENV, "SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER": "1"},
+    },
+    # Both paths at once. They are not additive and the split is not obvious:
+    # the model calls `fused_wo_b` first and the linear only ever sees what it
+    # declines, so at `wo_b` they divide the layer by M rather than stacking.
+    # What the standalone GEMM adds on top is the column-parallel layers --
+    # `wq_b` and `wqkv_a` -- which have no collective to fuse with at all.
+    {
+        "name": "both",
+        "env": {
+            **_FUSED_ENV,
+            "SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER": "1",
+            "SGLANG_OPT_MORI_MXFP8_GEMM": "1",
+            "SGLANG_OPT_MORI_MXFP8_GEMM_SHAPE_LOG": "1",
+        },
     },
 ]
 
@@ -340,6 +369,9 @@ class TestDeepseekV41FlashWoBFusionPerfMI35x(CustomTestCase):
 
     def test_c_fp8(self):
         self._run_variant(VARIANTS[2])
+
+    def test_d_both(self):
+        self._run_variant(VARIANTS[3])
 
 
 if __name__ == "__main__":
