@@ -31,12 +31,12 @@ Both operand forms the hook can hand over are served: a bf16 activation, and
 the fp8-plus-row-major-scale one a fused producer emits. The second needs the
 scale converting, which is not free, and is still a win -- see `_a_operands`.
 
-**Two mori kernels come through here, not one.** Above `_MIN_M` it is the GEMM
-above; below it, and only for an already-fp8 activation, it is a skinny GEMM
-built for decode's token counts. They are different kernels with different
-operand layouts and different reasons for being faster, and the split between
-them is `_GEMV_MAX_M`, which documents why it is the operand form rather than M
-that decides.
+**Two mori kernels come through here, not one.** Above 32 tokens it is the
+GEMM above, gated on `_MIN_GRID`; at or below 32, and only for an already-fp8
+activation, it is a skinny GEMM built for decode. They are different kernels
+with different operand layouts and different reasons for being faster, and the
+split between them is `_GEMV_MAX_M`, which documents why it is the operand form
+rather than M that decides.
 
 Returning None means "use the normal path" and is not a failure: an unsupported
 shape, a bf16 activation at decode, or an M in the band neither kernel wins all
@@ -68,30 +68,28 @@ logger = logging.getLogger(__name__)
 #: layers a quarter that wide.
 #:
 #: Scored over the 77 points this gate actually decides -- 12 shapes from the
-#: checkpoint, M above the GEMV's 32 tokens, and a shape `supports_gemm` accepts
-#: -- by the percentage each threshold gets wrong, losses served plus wins
-#: declined, cold:
+#: checkpoint, M above the GEMV's 32 tokens, and a shape `supports_gemm`
+#: accepts -- by the percentage each threshold gets wrong, losses served plus
+#: wins declined, cold:
 #:
-#:     gate                  served & slower   forfeited   total
-#:     grid >= 64                   49.2%         0.0%     49.2%
-#:     grid >= 80 (this)            17.7%         0.0%     17.7%
-#:     grid >= 96                    7.9%         2.6%     10.5%
-#:     grid >= 128                   7.9%        26.7%     34.6%
+#:     gate            served & slower   forfeited   total
+#:     grid >= 48             2.9%         0.0%      2.9%
+#:     grid >= 64 (this)      2.9%         0.0%      2.9%
+#:     grid >= 80             0.3%         7.0%      7.3%
+#:     grid >= 128            0.3%        60.7%     60.9%
 #:
-#: **96 is nominally better and 80 is kept anyway.** The 7-point gap between
-#: them is two measurements that sit at *exactly* grid 80 and disagree -- wo_b
-#: TP8 at M=1024 wins 2.6%, wq_a at M=4096 loses 9.0% -- so no threshold on the
-#: grid can separate them, and moving the constant to sit between two points it
-#: cannot distinguish is fitting noise rather than the curve.
+#: **64, where this said 80.** The move is a measurement fix, not a retune: the
+#: benchmark had been cooling only mori's weight, while SGLang's `hipblaslt_bf16`
+#: route reads a dequantised bf16 copy that stayed in cache. With both measured
+#: cold SGLang is slower on those rows, and mori starts winning at a smaller
+#: grid than it appeared to. 48 and 64 score identically because no measured
+#: point falls between them, so this is the edge of the evidence rather than a
+#: fitted optimum.
 #:
 #: A floor on M alone is a different matter and is wrong by an order of
 #: magnitude. `M >= 1280`, read off wq_b and wo_b, served wkv at M=2048 for
-#: +140% and wq_a for +55%.
-#:
-#: The same quantity, at 140, picks mori's N tile inside the op -- see
-#: `_WIDE_TILE_MIN_GRID` in mori's `gemm.py`. That it turns up twice is the
-#: point: both questions are "is this grid big enough", asked of the same grid.
-_MIN_GRID = 80
+#: +100% and wq_a for +38%.
+_MIN_GRID = 64
 
 #: The tile this grid is counted in. Must track mori's `MXFP8_BLOCK_M` and
 #: `DEFAULT_BLOCK_N`; both are 256 and neither is a knob a caller turns.
