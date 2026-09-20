@@ -137,7 +137,7 @@ SERVER_ARGS = [
     "DSPARK",
     "--speculative-dspark-block-size",
     "5",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "64",
     "--cuda-graph-backend-prefill",
     "breakable",
