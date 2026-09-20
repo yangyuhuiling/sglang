@@ -299,9 +299,11 @@ def _window_m_max(m_pad: int, world_size: int) -> int:
     a short prompt arriving first cannot fix a window too small for a full chunk
     later -- the window cannot grow once allocated.
     """
-    from sglang.srt.server_args import get_global_server_args
+    # `get_global_server_args()` is retired; the scheduling namespace carries
+    # the value in effect, which is what the other layers read.
+    from sglang.srt.runtime_context import get_schedule
 
-    limit = get_global_server_args().chunked_prefill_size
+    limit = get_schedule().chunked_prefill_size
     if limit is not None and limit > 0:
         return max(m_pad, _padded_m(limit, world_size))
     return m_pad
