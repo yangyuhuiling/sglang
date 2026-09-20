@@ -23,7 +23,7 @@ The ordering falls out for free and needs no coordination: the model calls
 `fused_wo_b` first and only reaches the linear when it declines, so this hook
 sees exactly the remainder.
 
-Hooked at `Fp8LinearMethod._apply_gfx95_native`, which is the one place every
+Hooked at `fp8_hip._apply_native`, which is the one place every
 `mxfp8_native_ready` layer passes through, and where the input has already been
 normalised to `(x, input_scale, input_on_fp8_grid)`.
 

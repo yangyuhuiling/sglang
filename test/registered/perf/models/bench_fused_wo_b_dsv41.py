@@ -159,7 +159,7 @@ def main():
             if args.variant == "base":
 
                 def call(x=x):
-                    # uint8, as _apply_gfx95_native passes it: the shuffled
+                    # uint8, as fp8_hip._apply_native passes it: the shuffled
                     # GEMM's weight load is typed uint8 and refuses an fp8 view
                     out = mxfp8_native_blockscaled_linear(
                         x,
